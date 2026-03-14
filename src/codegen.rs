@@ -309,6 +309,9 @@ fn generate_main_rs(
     let skip_argparse = !argparse_args.is_empty();
     let mut in_argparse_block = false;
 
+    // Track indentation depth to emit closing braces
+    let mut indent_stack: Vec<usize> = vec![0]; // stack of Python indentation levels
+
     for (_filename, pyfile) in files {
         // Join multi-line statements at top level too
         let raw_stmts: Vec<String> = pyfile.top_level.iter().map(|s| s.text.clone()).collect();
@@ -323,7 +326,8 @@ fn generate_main_rs(
                 // Keep meaningful comments
                 let comment = trimmed.trim_start_matches('#').trim();
                 if !comment.is_empty() {
-                    out.push_str(&format!("    // {}\n", comment));
+                    let rust_indent = "    ".repeat(indent_stack.len());
+                    out.push_str(&format!("{}// {}\n", rust_indent, comment));
                 }
                 continue;
             }
@@ -347,9 +351,40 @@ fn generate_main_rs(
                 in_argparse_block = false;
             }
 
+            // Calculate Python indentation level
+            let py_indent = stmt_text.len() - stmt_text.trim_start().len();
+
+            // elif/else already include closing `}` in their translation,
+            // so we pop the stack without emitting an extra brace.
+            let is_elif_else = trimmed.starts_with("elif ") || trimmed == "else:";
+
+            // Close blocks when indentation decreases
+            while indent_stack.len() > 1 && py_indent <= *indent_stack.last().unwrap() {
+                indent_stack.pop();
+                if !is_elif_else {
+                    let rust_indent = "    ".repeat(indent_stack.len());
+                    out.push_str(&format!("{}}}\n", rust_indent));
+                }
+            }
+
+            let rust_indent = "    ".repeat(indent_stack.len());
             let rust_line = translate_statement(trimmed);
-            out.push_str(&format!("    {}\n", rust_line));
+
+            // If the translated line opens a block (ends with {), push indent level
+            if rust_line.ends_with('{') {
+                out.push_str(&format!("{}{}\n", rust_indent, rust_line));
+                indent_stack.push(py_indent);
+            } else if !rust_line.is_empty() {
+                out.push_str(&format!("{}{}\n", rust_indent, rust_line));
+            }
         }
+    }
+
+    // Close any remaining open blocks
+    while indent_stack.len() > 1 {
+        indent_stack.pop();
+        let rust_indent = "    ".repeat(indent_stack.len());
+        out.push_str(&format!("{}}}\n", rust_indent));
     }
 
     out.push_str("}\n");
@@ -515,6 +550,7 @@ fn extract_layer_fields(init: &PyMethod) -> Vec<(String, String)> {
 fn join_multiline_exprs(lines: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
+    let mut current_prefix = String::new(); // preserved leading whitespace of first line
     let mut paren_depth: i32 = 0;
 
     for line in lines {
@@ -526,12 +562,15 @@ fn join_multiline_exprs(lines: &[String]) -> Vec<String> {
         let clean = clean.trim();
 
         if clean.is_empty() && paren_depth == 0 {
-            // Standalone empty/comment line outside an expression
-            result.push(trimmed.to_string());
+            // Standalone empty/comment line outside an expression — preserve indentation
+            result.push(line.to_string());
             continue;
         }
 
         if current.is_empty() {
+            // Preserve the original leading whitespace of the first line
+            let indent_len = line.len() - line.trim_start().len();
+            current_prefix = line[..indent_len].to_string();
             current = clean.to_string();
         } else if !clean.is_empty() {
             current.push(' ');
@@ -548,14 +587,16 @@ fn join_multiline_exprs(lines: &[String]) -> Vec<String> {
         }
 
         if paren_depth <= 0 {
-            result.push(current.clone());
+            // Re-attach original indentation so callers can track indent level
+            result.push(format!("{}{}", current_prefix, current));
             current.clear();
+            current_prefix.clear();
             paren_depth = 0;
         }
     }
 
     if !current.is_empty() {
-        result.push(current);
+        result.push(format!("{}{}", current_prefix, current));
     }
 
     result
@@ -1325,10 +1366,11 @@ fn translate_statement(py: &str) -> String {
     let re_save = Regex::new(r"torch\.save\((\w+)\.state_dict\(\),\s*(.+)\)").unwrap();
     if let Some(caps) = re_save.captures(trimmed) {
         let model = &caps[1];
-        let path = &caps[2];
+        let path_expr = &caps[2];
+        let rust_path = translate_python_format_string(path_expr);
         return format!(
             "let _bytes = theano_serialize::save_state_dict(&{model}.state_dict());\n    \
-             std::fs::write({path}, _bytes).expect(\"failed to save checkpoint\");",
+             std::fs::write({rust_path}, _bytes).expect(\"failed to save checkpoint\");",
         );
     }
     if trimmed.contains("torch.save") {
@@ -1516,6 +1558,45 @@ fn translate_statement(py: &str) -> String {
     format!("// TODO: {}", rust_line)
 }
 
+/// Translate a Python `'format' % (args)` or `'format' % var` expression
+/// to a Rust `format!("format", args)` expression. If the input doesn't match
+/// the pattern, apply `python_strings_to_rust` and return as-is.
+fn translate_python_format_string(py: &str) -> String {
+    let trimmed = py.trim();
+
+    // Match 'format' % (args) or "format" % (args)
+    let re_pct = Regex::new(r#"^['"](.+?)['"]\s*%\s*\((.+)\)$"#).unwrap();
+    if let Some(caps) = re_pct.captures(trimmed) {
+        let fmt_str = &caps[1];
+        let args = &caps[2];
+        let rust_fmt = fmt_str
+            .replace("%s", "{}")
+            .replace("%d", "{}")
+            .replace("%03d", "{:03}")
+            .replace("%.4f", "{:.4}")
+            .replace("%.2f", "{:.2}")
+            .replace("%f", "{}");
+        return format!("format!(\"{}\", {})", rust_fmt, args);
+    }
+
+    // Match 'format' % single_var
+    let re_pct_single = Regex::new(r#"^['"](.+?)['"]\s*%\s*(\w+)$"#).unwrap();
+    if let Some(caps) = re_pct_single.captures(trimmed) {
+        let fmt_str = &caps[1];
+        let var = &caps[2];
+        let rust_fmt = fmt_str
+            .replace("%s", "{}")
+            .replace("%d", "{}")
+            .replace("%03d", "{:03}")
+            .replace("%.4f", "{:.4}")
+            .replace("%.2f", "{:.2}")
+            .replace("%f", "{}");
+        return format!("format!(\"{}\", {})", rust_fmt, var);
+    }
+
+    python_strings_to_rust(trimmed)
+}
+
 /// Convert Python single-quoted string literals to Rust double-quoted strings.
 /// Handles `'text'` -> `"text"` and `''` -> `""`, while preserving char-like
 /// single chars used in contexts like `.split(',')`.
@@ -1629,5 +1710,37 @@ mod tests {
             remove_kwargs("batch_size, nz, 1, 1, device=device"),
             "batch_size, nz, 1, 1"
         );
+    }
+
+    #[test]
+    fn test_python_strings_to_rust() {
+        assert_eq!(python_strings_to_rust("'fake'"), "\"fake\"");
+        assert_eq!(python_strings_to_rust("''"), "\"\"");
+        assert_eq!(python_strings_to_rust("'imagenet'"), "\"imagenet\"");
+        // Preserve single-char in split() context
+        assert_eq!(python_strings_to_rust("split(',')"), "split(',')");
+        // Multi-word strings
+        assert_eq!(
+            python_strings_to_rust("'hello world'"),
+            "\"hello world\""
+        );
+    }
+
+    #[test]
+    fn test_translate_condition_in_list() {
+        let result = translate_condition("opt.dataset in ['imagenet', 'folder', 'lfw']");
+        assert!(result.contains("[\"imagenet\", \"folder\", \"lfw\"].contains(&opt.dataset)"));
+    }
+
+    #[test]
+    fn test_translate_condition_string_comparison() {
+        let result = translate_condition("opt.dataset == 'fake'");
+        assert_eq!(result, "opt.dataset == \"fake\"");
+    }
+
+    #[test]
+    fn test_translate_condition_empty_string() {
+        let result = translate_condition("opt.netG != ''");
+        assert_eq!(result, "opt.netG != \"\"");
     }
 }

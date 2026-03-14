@@ -188,37 +188,40 @@ fn main() {
     // TODO: try:
     // TODO: os.makedirs(opt.outf)
     // TODO: except OSError:
-    
     if opt.manualSeed.is_none() {
-    // TODO: opt.manualSeed = random.randint(1, 10000)
+        // TODO: opt.manualSeed = random.randint(1, 10000)
+    }
     println!("{}", "Random Seed: ", opt.manualSeed);
     // TODO: random.seed(opt.manualSeed)
     // TODO: torch.manual_seed(opt.manualSeed)
     // TODO: cudnn.benchmark = True
     if opt.accel && torch.accelerator.is_available() {
-    let device = torch.accelerator.current_accelerator(); // TODO: verify
+        let device = torch.accelerator.current_accelerator(); // TODO: verify
     } else {
-    let device = torch.device("cpu"); // TODO: verify
+        let device = torch.device("cpu"); // TODO: verify
+    }
     // TODO: println!(f"Using device: {device}");
-    if opt.dataroot.is_none() && str(opt.dataset).lower() != 'fake' {
-    // TODO: raise ValueError("`dataroot` parameter is required for dataset \"%s\"" % opt.dataset)
-    if opt.dataset in ['imagenet', 'folder', 'lfw'] {
-    // folder dataset
-    let dataset = dset.ImageFolder(root=opt.dataroot, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.CenterCrop(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
-    let nc = 3;
-    } else if opt.dataset == 'lsun' {
-    let classes = [ c + '_train' for c in opt.classes.split(',')]; // TODO: verify
-    let dataset = dset.LSUN(root=opt.dataroot, classes=classes, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.CenterCrop(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
-    let nc = 3;
-    } else if opt.dataset == 'cifar10' {
-    let dataset = dset.CIFAR10(root=opt.dataroot, download=True, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
-    let nc = 3;
-    } else if opt.dataset == 'mnist' {
-    let dataset = dset.MNIST(root=opt.dataroot, download=True, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,)), ])); // TODO: verify
-    let nc = 1;
-    } else if opt.dataset == 'fake' {
-    let dataset = dset.FakeData(image_size=(3, opt.imageSize, opt.imageSize), transform=transforms.ToTensor()); // TODO: verify
-    let nc = 3;
+    if opt.dataroot.is_none() && str(opt.dataset).lower() != "fake" {
+        // TODO: raise ValueError("`dataroot` parameter is required for dataset \"%s\"" % opt.dataset)
+    }
+    if ["imagenet", "folder", "lfw"].contains(&opt.dataset) {
+        // folder dataset
+        let dataset = dset.ImageFolder(root=opt.dataroot, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.CenterCrop(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
+        let nc = 3;
+    } else if opt.dataset == "lsun" {
+        let classes = [ c + "_train" for c in opt.classes.split(',')]; // TODO: verify
+        let dataset = dset.LSUN(root=opt.dataroot, classes=classes, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.CenterCrop(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
+        let nc = 3;
+    } else if opt.dataset == "cifar10" {
+        let dataset = dset.CIFAR10(root=opt.dataroot, download=True, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
+        let nc = 3;
+    } else if opt.dataset == "mnist" {
+        let dataset = dset.MNIST(root=opt.dataroot, download=True, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,)), ])); // TODO: verify
+        let nc = 1;
+    } else if opt.dataset == "fake" {
+        let dataset = dset.FakeData(image_size=(3, opt.imageSize, opt.imageSize), transform=transforms.ToTensor()); // TODO: verify
+        let nc = 3;
+    }
     assert!(dataset);
     let dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.workers)); // TODO: verify
     let ngpu = opt.ngpu as usize;
@@ -228,19 +231,21 @@ fn main() {
     // custom weights initialization called on netG and netD
     let netG = Generator::new(ngpu);
     // TODO: netG.apply(weights_init)
-    if opt.netG != '' {
-    // Load state dict for netG
+    if opt.netG != "" {
+        // Load state dict for netG
     let _bytes = std::fs::read(opt.netG).expect("failed to read checkpoint");
     let _state = theano_serialize::load_state_dict(&_bytes).expect("failed to load state dict");
     // TODO: apply _state to netG
+    }
     println!("{}", netG);
     let netD = Discriminator::new(ngpu);
     // TODO: netD.apply(weights_init)
-    if opt.netD != '' {
-    // Load state dict for netD
+    if opt.netD != "" {
+        // Load state dict for netD
     let _bytes = std::fs::read(opt.netD).expect("failed to read checkpoint");
     let _state = theano_serialize::load_state_dict(&_bytes).expect("failed to load state dict");
     // TODO: apply _state to netD
+    }
     println!("{}", netD);
     let criterion = BCELoss::new();
     let fixed_noise = Variable::new(Tensor::randn(&[opt.batchSize, nz, 1, 1]));
@@ -250,47 +255,52 @@ fn main() {
     let mut optimizerD = Adam::new(netD.parameters(), opt.lr).betas(opt.beta1, 0.999);
     let mut optimizerG = Adam::new(netG.parameters(), opt.lr).betas(opt.beta1, 0.999);
     if opt.dry_run {
-    // TODO: opt.niter = 1
+        // TODO: opt.niter = 1
+    }
     for epoch in 0..opt.niter {
-    for (i, data) in dataloader.iter().enumerate() {
-    // (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-    // train with real
-    netD.zero_grad();
-    let real_cpu = data[0].to(device); // TODO: verify
-    let batch_size = real_cpu.size(0); // TODO: verify
-    let label = Variable::new(Tensor::full(&[batch_size,], real_label));
-    let output = netD.forward(&real_cpu);
-    let errD_real = criterion.forward(&output, &label);
-    errD_real.backward();
-    let D_x = output.mean().item(); // TODO: verify
-    // train with fake
-    let noise = Variable::new(Tensor::randn(&[batch_size, nz, 1, 1]));
-    let fake = netG.forward(&noise);
-    // TODO: label.fill_(fake_label);
-    let output = netD.forward(&fake.detach());
-    let errD_fake = criterion.forward(&output, &label);
-    errD_fake.backward();
-    let D_G_z1 = output.mean().item(); // TODO: verify
-    let errD = errD_real + errD_fake; // TODO: verify
-    optimizerD.step();
-    // (2) Update G network: maximize log(D(G(z)))
-    netG.zero_grad();
-    // TODO: label.fill_(real_label);
-    let output = netD.forward(&fake);
-    let errG = criterion.forward(&output, &label);
-    errG.backward();
-    let D_G_z2 = output.mean().item(); // TODO: verify
-    optimizerG.step();
-    println!("{}", '[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f D(x): %.4f D(G(z)): %.4f / %.4f' % (epoch, opt.niter, i, len(dataloader), errD.item(), errG.item(), D_x, D_G_z1, D_G_z2));
-    if i % 100 == 0 {
-    // TODO: vutils.save_image(real_cpu, '%s/real_samples.png' % opt.outf, normalize=True) (torchvision has no Neo Theano equivalent)
-    let fake = netG.forward(&fixed_noise);
-    // TODO: vutils.save_image(fake.detach(), '%s/fake_samples_epoch_%03d.png' % (opt.outf, epoch), normalize=True) (torchvision has no Neo Theano equivalent)
-    if opt.dry_run {
-    break;
-    // do checkpointing
-    let _bytes = theano_serialize::save_state_dict(&netG.state_dict());
-    std::fs::write('%s/netG_epoch_%d.pth' % (opt.outf, epoch), _bytes).expect("failed to save checkpoint");
-    let _bytes = theano_serialize::save_state_dict(&netD.state_dict());
-    std::fs::write('%s/netD_epoch_%d.pth' % (opt.outf, epoch), _bytes).expect("failed to save checkpoint");
+        for (i, data) in dataloader.iter().enumerate() {
+            // (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+            // train with real
+            netD.zero_grad();
+            let real_cpu = data[0].to(device); // TODO: verify
+            let batch_size = real_cpu.size(0); // TODO: verify
+            let label = Variable::new(Tensor::full(&[batch_size,], real_label));
+            let output = netD.forward(&real_cpu);
+            let errD_real = criterion.forward(&output, &label);
+            errD_real.backward();
+            let D_x = output.mean().item(); // TODO: verify
+            // train with fake
+            let noise = Variable::new(Tensor::randn(&[batch_size, nz, 1, 1]));
+            let fake = netG.forward(&noise);
+            // TODO: label.fill_(fake_label);
+            let output = netD.forward(&fake.detach());
+            let errD_fake = criterion.forward(&output, &label);
+            errD_fake.backward();
+            let D_G_z1 = output.mean().item(); // TODO: verify
+            let errD = errD_real + errD_fake; // TODO: verify
+            optimizerD.step();
+            // (2) Update G network: maximize log(D(G(z)))
+            netG.zero_grad();
+            // TODO: label.fill_(real_label);
+            let output = netD.forward(&fake);
+            let errG = criterion.forward(&output, &label);
+            errG.backward();
+            let D_G_z2 = output.mean().item(); // TODO: verify
+            optimizerG.step();
+            println!("[{}/{}][{}/{}] Loss_D: {:.4} Loss_G: {:.4} D(x): {:.4} D(G(z)): {:.4} / {:.4}", epoch, opt.niter, i, len(dataloader), errD.item(), errG.item(), D_x, D_G_z1, D_G_z2);
+            if i % 100 == 0 {
+                // TODO: vutils.save_image(real_cpu, '%s/real_samples.png' % opt.outf, normalize=True) (torchvision has no Neo Theano equivalent)
+                let fake = netG.forward(&fixed_noise);
+                // TODO: vutils.save_image(fake.detach(), '%s/fake_samples_epoch_%03d.png' % (opt.outf, epoch), normalize=True) (torchvision has no Neo Theano equivalent)
+            }
+            if opt.dry_run {
+                break;
+                // do checkpointing
+            }
+        }
+        let _bytes = theano_serialize::save_state_dict(&netG.state_dict());
+    std::fs::write(format!("{}/netG_epoch_{}.pth", opt.outf, epoch), _bytes).expect("failed to save checkpoint");
+        let _bytes = theano_serialize::save_state_dict(&netD.state_dict());
+    std::fs::write(format!("{}/netD_epoch_{}.pth", opt.outf, epoch), _bytes).expect("failed to save checkpoint");
+    }
 }
