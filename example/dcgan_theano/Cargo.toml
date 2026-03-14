@@ -7,3 +7,4 @@ edition = "2021"
 theano = { git = "https://github.com/Neo-Theano/theano.git", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
+theano-serialize = { git = "https://github.com/Neo-Theano/theano.git" }

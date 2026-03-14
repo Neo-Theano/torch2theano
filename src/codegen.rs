@@ -121,6 +121,19 @@ fn generate_cargo_toml_named(files: &[(String, PyFile)], name: &str) -> String {
         deps.push(r#"rand = "0.8""#.to_string());
     }
 
+    // Check for save/load usage (need theano-serialize)
+    let uses_save_load = files.iter().any(|(_, f)| {
+        f.top_level
+            .iter()
+            .any(|s| s.text.contains("torch.save") || s.text.contains("torch.load"))
+    });
+    if uses_save_load {
+        deps.push(
+            r#"theano-serialize = { git = "https://github.com/Neo-Theano/theano.git" }"#
+                .to_string(),
+        );
+    }
+
     let deps_str = deps
         .iter()
         .map(|d| format!("{d}"))
@@ -199,6 +212,16 @@ fn generate_main_rs(
     }
 
     out.push_str("use theano_types::Device;\n");
+
+    // Check if save/load is used
+    let uses_save_load = files.iter().any(|(_, f)| {
+        f.top_level
+            .iter()
+            .any(|s| s.text.contains("torch.save") || s.text.contains("torch.load"))
+    });
+    if uses_save_load {
+        out.push_str("use theano_serialize::{save_state_dict, load_state_dict};\n");
+    }
 
     // Check if clap is needed
     let uses_argparse = files.iter().any(|(_, f)| {
@@ -1237,6 +1260,22 @@ fn translate_statement(py: &str) -> String {
         if content.starts_with("f\"") || content.starts_with("f'") {
             return format!("// TODO: println!({});", content);
         }
+        // Handle Python % format strings: 'format' % (args) or "format" % (args)
+        let re_pct_fmt = Regex::new(r#"^['"](.+?)['"]\s*%\s*\((.+)\)$"#).unwrap();
+        if let Some(fcaps) = re_pct_fmt.captures(content) {
+            let fmt_str = &fcaps[1];
+            let args = &fcaps[2];
+            // Convert Python format specifiers to Rust: %d -> {}, %.4f -> {:.4}, %s -> {}
+            let rust_fmt = fmt_str
+                .replace("%d", "{}")
+                .replace("%s", "{}")
+                .replace("%.4f", "{:.4}")
+                .replace("%.2f", "{:.2}")
+                .replace("%.6f", "{:.6}")
+                .replace("%f", "{}");
+            return format!("println!(\"{}\", {});", rust_fmt, args);
+        }
+        let content = python_strings_to_rust(content);
         return format!("println!(\"{{}}\", {});", content);
     }
 
@@ -1266,12 +1305,32 @@ fn translate_statement(py: &str) -> String {
         return format!("// TODO: {}", trimmed);
     }
 
-    // .load_state_dict(torch.load(...))
+    // .load_state_dict(torch.load(path))
+    let re_load_sd = Regex::new(r"(\w+)\.load_state_dict\(torch\.load\((.+?)\)\)").unwrap();
+    if let Some(caps) = re_load_sd.captures(trimmed) {
+        let model = &caps[1];
+        let path = &caps[2];
+        return format!(
+            "// Load state dict for {model}\n    \
+             let _bytes = std::fs::read({path}).expect(\"failed to read checkpoint\");\n    \
+             let _state = theano_serialize::load_state_dict(&_bytes).expect(\"failed to load state dict\");\n    \
+             // TODO: apply _state to {model}",
+        );
+    }
     if trimmed.contains("load_state_dict") {
         return format!("// TODO: {}", trimmed);
     }
 
-    // torch.save(...) -> theano_serialize
+    // torch.save(model.state_dict(), path)
+    let re_save = Regex::new(r"torch\.save\((\w+)\.state_dict\(\),\s*(.+)\)").unwrap();
+    if let Some(caps) = re_save.captures(trimmed) {
+        let model = &caps[1];
+        let path = &caps[2];
+        return format!(
+            "let _bytes = theano_serialize::save_state_dict(&{model}.state_dict());\n    \
+             std::fs::write({path}, _bytes).expect(\"failed to save checkpoint\");",
+        );
+    }
     if trimmed.contains("torch.save") {
         return format!("// TODO: {}", trimmed);
     }
@@ -1407,8 +1466,35 @@ fn translate_statement(py: &str) -> String {
             return format!("{}.zero_grad();", val.replace(".zero_grad()", ""));
         }
 
+        // model(x) -> model.forward(&x) for nn.Module calls
+        // Matches: var = modelName(arg) or var = modelName(arg.method())
+        let re_model_call = Regex::new(r"^([A-Za-z]\w*)\((.+)\)$").unwrap();
+        if let Some(mcaps) = re_model_call.captures(val) {
+            let callee = &mcaps[1];
+            let args = &mcaps[2];
+            // Known patterns: criterion(a, b) -> criterion.forward(&a, &b)
+            // model(x) -> model.forward(&x)
+            if callee == "criterion" || callee.starts_with("loss") {
+                let translated_args = args
+                    .split(',')
+                    .map(|a| format!("&{}", a.trim()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!("let {} = {}.forward({});", var, callee, translated_args);
+            }
+            // General model call: netG(noise) -> netG.forward(&noise)
+            let arg = args.trim();
+            return format!("let {} = {}.forward(&{});", var, callee, arg);
+        }
+
         // Default: let var = val;
+        let val = python_strings_to_rust(val);
         return format!("let {} = {}; // TODO: verify", var, val);
+    }
+
+    // torchvision utils calls
+    if trimmed.contains("vutils.") || trimmed.contains("torchvision.") {
+        return format!("// TODO: {} (torchvision has no Neo Theano equivalent)", trimmed);
     }
 
     // Method calls without assignment
@@ -1425,20 +1511,86 @@ fn translate_statement(py: &str) -> String {
         return format!("// TODO: {};", trimmed);
     }
 
-    // Fallback
-    format!("// TODO: {}", trimmed)
+    // Fallback — convert any remaining Python strings
+    let rust_line = python_strings_to_rust(trimmed);
+    format!("// TODO: {}", rust_line)
+}
+
+/// Convert Python single-quoted string literals to Rust double-quoted strings.
+/// Handles `'text'` -> `"text"` and `''` -> `""`, while preserving char-like
+/// single chars used in contexts like `.split(',')`.
+fn python_strings_to_rust(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            let start = i;
+            i += 1;
+            let mut content = String::new();
+            while i < chars.len() && chars[i] != '\'' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    content.push(chars[i]);
+                    content.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    content.push(chars[i]);
+                    i += 1;
+                }
+            }
+            if i < chars.len() {
+                i += 1; // skip closing '
+                // Keep as single-quoted only for single chars in split()/find() context
+                if content.len() == 1 && start > 0 {
+                    let before: String = chars[..start].iter().collect();
+                    if before.ends_with("split(") || before.ends_with("find(") {
+                        out.push('\'');
+                        out.push_str(&content);
+                        out.push('\'');
+                        continue;
+                    }
+                }
+                out.push('"');
+                out.push_str(&content);
+                out.push('"');
+            } else {
+                out.push('\'');
+                out.push_str(&content);
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Translate a Python condition to Rust.
 fn translate_condition(py: &str) -> String {
-    py.replace(" and ", " && ")
+    let mut result = py.to_string();
+
+    // Handle `x in ['a', 'b', 'c']` -> `["a", "b", "c"].contains(&x)`
+    let re_in_list = Regex::new(r"(\S+)\s+in\s+\[([^\]]+)\]").unwrap();
+    if let Some(caps) = re_in_list.captures(&result.clone()) {
+        let var = caps[1].to_string();
+        let items = caps[2].to_string();
+        let rust_items = python_strings_to_rust(&items);
+        result = re_in_list
+            .replace(&result, format!("[{}].contains(&{})", rust_items, var))
+            .to_string();
+    }
+
+    result = result
+        .replace(" and ", " && ")
         .replace(" or ", " || ")
         .replace(" is None", ".is_none()")
         .replace(" is not None", ".is_some()")
         .replace(" not ", " !")
         .replace("True", "true")
         .replace("False", "false")
-        .replace("None", "None")
+        .replace("None", "None");
+
+    python_strings_to_rust(&result)
 }
 
 #[cfg(test)]
