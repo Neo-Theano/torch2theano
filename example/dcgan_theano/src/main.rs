@@ -1,16 +1,12 @@
 // Converted from PyTorch Python to Neo Theano Rust by torch2theano.
 //
-// Manual attention required:
-//   - torchvision.datasets has no Neo Theano equivalent
-//   - torchvision.transforms has no Neo Theano equivalent
-//   - torchvision.utils has no Neo Theano equivalent
-//
+// NOTE: Some PyTorch features (datasets, transforms, image saving)
+// have no Neo Theano equivalent yet. Dataset loading is stubbed with
+// random tensors as placeholder data.
 
 use theano::prelude::*;
 use theano::nn::*;
-use theano::optim::{Adam, SGD, Optimizer};
-// use theano::data::{DataLoader, Dataset};
-use theano_types::Device;
+use theano::optim::{Adam, Optimizer};
 use theano_serialize::{save_state_dict, load_state_dict};
 use clap::Parser;
 use rand::Rng;
@@ -21,7 +17,7 @@ struct Generator {
 }
 
 impl Generator {
-    fn new(ngpu: usize) -> Self {
+    fn new(nz: usize, ngf: usize, nc: usize, _ngpu: usize) -> Self {
         let main = Sequential::new(vec![])
             .add(Conv2d::with_options(nz, ngf * 8, (4, 4), (1, 1), (0, 0), false))
             .add(BatchNorm1d::new(ngf * 8))
@@ -37,9 +33,7 @@ impl Generator {
             .add(ReLU)
             .add(Conv2d::with_options(ngf, nc, (4, 4), (2, 2), (1, 1), false))
             .add(Tanh);
-        Self {
-            main,
-        }
+        Self { main }
     }
 }
 
@@ -59,31 +53,29 @@ struct Discriminator {
 }
 
 impl Discriminator {
-    fn new(ngpu: usize) -> Self {
+    fn new(nc: usize, ndf: usize, _ngpu: usize) -> Self {
         let main = Sequential::new(vec![])
             .add(Conv2d::with_options(nc, ndf, (4, 4), (2, 2), (1, 1), false))
-            .add(ReLU /* TODO: LeakyReLU(0.2) */)
+            .add(ReLU) // TODO: LeakyReLU(0.2)
             .add(Conv2d::with_options(ndf, ndf * 2, (4, 4), (2, 2), (1, 1), false))
             .add(BatchNorm1d::new(ndf * 2))
-            .add(ReLU /* TODO: LeakyReLU(0.2) */)
+            .add(ReLU) // TODO: LeakyReLU(0.2)
             .add(Conv2d::with_options(ndf * 2, ndf * 4, (4, 4), (2, 2), (1, 1), false))
             .add(BatchNorm1d::new(ndf * 4))
-            .add(ReLU /* TODO: LeakyReLU(0.2) */)
+            .add(ReLU) // TODO: LeakyReLU(0.2)
             .add(Conv2d::with_options(ndf * 4, ndf * 8, (4, 4), (2, 2), (1, 1), false))
             .add(BatchNorm1d::new(ndf * 8))
-            .add(ReLU /* TODO: LeakyReLU(0.2) */)
+            .add(ReLU) // TODO: LeakyReLU(0.2)
             .add(Conv2d::with_options(ndf * 8, 1, (4, 4), (1, 1), (0, 0), false))
             .add(Sigmoid);
-        Self {
-            main,
-        }
+        Self { main }
     }
 }
 
 impl Module for Discriminator {
     fn forward(&self, input: &Variable) -> Variable {
         let x = self.main.forward(input);
-        x.reshape(&[-1, 1]).unwrap()
+        x.view(&[-1, 1]).unwrap()
     }
 
     fn parameters(&self) -> Vec<Variable> {
@@ -91,19 +83,17 @@ impl Module for Discriminator {
     }
 }
 
-fn weights_init(m: /* TODO */) {
-    // TODO: classname = m.__class__.__name__
-    // TODO: if classname.find('Conv') != -1:
-    // TODO: torch.nn.init.normal_(m.weight, 0.0, 0.02)
-    // TODO: elif classname.find('BatchNorm') != -1:
-    // TODO: torch.nn.init.normal_(m.weight, 1.0, 0.02)
-    // TODO: torch.nn.init.zeros_(m.bias)
+/// Weight initialization placeholder.
+fn weights_init(_module: &dyn Module) {
+    // TODO: Apply per-layer initialization:
+    // - Conv layers: normal_(weight, 0.0, 0.02)
+    // - BatchNorm layers: normal_(weight, 1.0, 0.02), zeros_(bias)
 }
 
 #[derive(Parser)]
-#[command(about = "Converted from PyTorch")]
+#[command(about = "DCGAN training example")]
 struct Args {
-    /// cifar10 | lsun | mnist |imagenet | folder | lfw | fake
+    /// cifar10 | lsun | mnist | imagenet | folder | lfw | fake
     #[arg(long)]
     dataset: Option<String>,
 
@@ -139,16 +129,16 @@ struct Args {
     #[arg(long, default_value_t = 25)]
     niter: usize,
 
-    /// learning rate, default=0.0002
+    /// learning rate
     #[arg(long, default_value_t = 0.0002)]
     lr: f64,
 
-    /// beta1 for adam. default=0.5
+    /// beta1 for adam
     #[arg(long, default_value_t = 0.5)]
     beta1: f64,
 
     /// check a single training cycle works
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     dry_run: bool,
 
     /// number of GPUs to use
@@ -156,15 +146,15 @@ struct Args {
     ngpu: usize,
 
     /// path to netG (to continue training)
-    #[arg(long, default_value_t = String::new().into())]
+    #[arg(long, default_value = "")]
     netg: String,
 
     /// path to netD (to continue training)
-    #[arg(long, default_value_t = String::new().into())]
+    #[arg(long, default_value = "")]
     netd: String,
 
     /// folder to output images and model checkpoints
-    #[arg(long, default_value_t = ".".into())]
+    #[arg(long, default_value = ".")]
     outf: String,
 
     /// manual seed
@@ -172,135 +162,147 @@ struct Args {
     manualseed: Option<usize>,
 
     /// comma separated list of classes for the lsun data set
-    #[arg(long, default_value_t = "bedroom".into())]
+    #[arg(long, default_value = "bedroom")]
     classes: String,
 
     /// enables accelerator
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     accel: bool,
-
 }
 
 fn main() {
     let args = Args::parse();
 
-    println!("{}", opt);
-    // TODO: try:
-    // TODO: os.makedirs(opt.outf)
-    // TODO: except OSError:
-    if opt.manualSeed.is_none() {
-        // TODO: opt.manualSeed = random.randint(1, 10000)
-    }
-    println!("{}", "Random Seed: ", opt.manualSeed);
-    // TODO: random.seed(opt.manualSeed)
-    // TODO: torch.manual_seed(opt.manualSeed)
-    // TODO: cudnn.benchmark = True
-    if opt.accel && torch.accelerator.is_available() {
-        let device = torch.accelerator.current_accelerator(); // TODO: verify
+    // Create output directory
+    std::fs::create_dir_all(&args.outf).ok();
+
+    // Set random seed
+    let seed = args.manualseed.unwrap_or_else(|| {
+        rand::thread_rng().gen_range(1..=10000)
+    });
+    println!("Random Seed: {}", seed);
+
+    // Determine device
+    let _device = if args.accel {
+        // TODO: check accelerator availability
+        Device::Cpu
     } else {
-        let device = torch.device("cpu"); // TODO: verify
+        Device::Cpu
+    };
+
+    // Number of channels (depends on dataset)
+    let nc: usize = match args.dataset.as_deref() {
+        Some("mnist") => 1,
+        _ => 3,
+    };
+
+    let nz = args.nz;
+    let ngf = args.ngf;
+    let ndf = args.ndf;
+    let ngpu = args.ngpu;
+
+    // Create Generator
+    let net_g = Generator::new(nz, ngf, nc, ngpu);
+    weights_init(&net_g);
+    if !args.netg.is_empty() {
+        let bytes = std::fs::read(&args.netg).expect("failed to read generator checkpoint");
+        let _state = load_state_dict(&bytes).expect("failed to load generator state dict");
+        // TODO: apply _state to net_g
     }
-    // TODO: println!(f"Using device: {device}");
-    if opt.dataroot.is_none() && str(opt.dataset).lower() != "fake" {
-        // TODO: raise ValueError("`dataroot` parameter is required for dataset \"%s\"" % opt.dataset)
+    println!("Generator created with {} parameters", net_g.num_parameters());
+
+    // Create Discriminator
+    let net_d = Discriminator::new(nc, ndf, ngpu);
+    weights_init(&net_d);
+    if !args.netd.is_empty() {
+        let bytes = std::fs::read(&args.netd).expect("failed to read discriminator checkpoint");
+        let _state = load_state_dict(&bytes).expect("failed to load discriminator state dict");
+        // TODO: apply _state to net_d
     }
-    if ["imagenet", "folder", "lfw"].contains(&opt.dataset) {
-        // folder dataset
-        let dataset = dset.ImageFolder(root=opt.dataroot, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.CenterCrop(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
-        let nc = 3;
-    } else if opt.dataset == "lsun" {
-        let classes = [ c + "_train" for c in opt.classes.split(',')]; // TODO: verify
-        let dataset = dset.LSUN(root=opt.dataroot, classes=classes, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.CenterCrop(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
-        let nc = 3;
-    } else if opt.dataset == "cifar10" {
-        let dataset = dset.CIFAR10(root=opt.dataroot, download=True, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ])); // TODO: verify
-        let nc = 3;
-    } else if opt.dataset == "mnist" {
-        let dataset = dset.MNIST(root=opt.dataroot, download=True, transform=transforms.Compose([ transforms.Resize(opt.imageSize), transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,)), ])); // TODO: verify
-        let nc = 1;
-    } else if opt.dataset == "fake" {
-        let dataset = dset.FakeData(image_size=(3, opt.imageSize, opt.imageSize), transform=transforms.ToTensor()); // TODO: verify
-        let nc = 3;
-    }
-    assert!(dataset);
-    let dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize, shuffle=True, num_workers=int(opt.workers)); // TODO: verify
-    let ngpu = opt.ngpu as usize;
-    let nz = opt.nz as usize;
-    let ngf = opt.ngf as usize;
-    let ndf = opt.ndf as usize;
-    // custom weights initialization called on netG and netD
-    let netG = Generator::new(ngpu);
-    // TODO: netG.apply(weights_init)
-    if opt.netG != "" {
-        // Load state dict for netG
-    let _bytes = std::fs::read(opt.netG).expect("failed to read checkpoint");
-    let _state = theano_serialize::load_state_dict(&_bytes).expect("failed to load state dict");
-    // TODO: apply _state to netG
-    }
-    println!("{}", netG);
-    let netD = Discriminator::new(ngpu);
-    // TODO: netD.apply(weights_init)
-    if opt.netD != "" {
-        // Load state dict for netD
-    let _bytes = std::fs::read(opt.netD).expect("failed to read checkpoint");
-    let _state = theano_serialize::load_state_dict(&_bytes).expect("failed to load state dict");
-    // TODO: apply _state to netD
-    }
-    println!("{}", netD);
+    println!("Discriminator created with {} parameters", net_d.num_parameters());
+
     let criterion = BCELoss::new();
-    let fixed_noise = Variable::new(Tensor::randn(&[opt.batchSize, nz, 1, 1]));
-    let real_label = 1;
-    let fake_label = 0;
-    // setup optimizer
-    let mut optimizerD = Adam::new(netD.parameters(), opt.lr).betas(opt.beta1, 0.999);
-    let mut optimizerG = Adam::new(netG.parameters(), opt.lr).betas(opt.beta1, 0.999);
-    if opt.dry_run {
-        // TODO: opt.niter = 1
-    }
-    for epoch in 0..opt.niter {
-        for (i, data) in dataloader.iter().enumerate() {
-            // (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-            // train with real
-            netD.zero_grad();
-            let real_cpu = data[0].to(device); // TODO: verify
-            let batch_size = real_cpu.size(0); // TODO: verify
-            let label = Variable::new(Tensor::full(&[batch_size,], real_label));
-            let output = netD.forward(&real_cpu);
-            let errD_real = criterion.forward(&output, &label);
-            errD_real.backward();
-            let D_x = output.mean().item(); // TODO: verify
-            // train with fake
+    let fixed_noise = Variable::new(Tensor::randn(&[args.batchsize, nz, 1, 1]));
+    let real_label: f64 = 1.0;
+    let fake_label: f64 = 0.0;
+
+    // Setup optimizers
+    let mut optimizer_d = Adam::new(net_d.parameters(), args.lr)
+        .betas(args.beta1, 0.999);
+    let mut optimizer_g = Adam::new(net_g.parameters(), args.lr)
+        .betas(args.beta1, 0.999);
+
+    let niter = if args.dry_run { 1 } else { args.niter };
+
+    // TODO: Dataset/DataLoader not yet available in Neo Theano.
+    // Using random tensors as placeholder data.
+    for epoch in 0..niter {
+        let num_batches: usize = 1; // placeholder until DataLoader is available
+        for i in 0..num_batches {
+            let batch_size = args.batchsize;
+
+            // ============================
+            // (1) Update D: maximize log(D(x)) + log(1 - D(G(z)))
+            // ============================
+            optimizer_d.zero_grad();
+
+            // Train with real (placeholder random data)
+            let real_cpu = Variable::new(
+                Tensor::randn(&[batch_size, nc, args.imagesize, args.imagesize]),
+            );
+            let label = Variable::new(Tensor::full(&[batch_size], real_label));
+            let output = net_d.forward(&real_cpu);
+            let err_d_real = criterion.forward(&output, &label);
+            err_d_real.backward();
+
+            // Train with fake
             let noise = Variable::new(Tensor::randn(&[batch_size, nz, 1, 1]));
-            let fake = netG.forward(&noise);
-            // TODO: label.fill_(fake_label);
-            let output = netD.forward(&fake.detach());
-            let errD_fake = criterion.forward(&output, &label);
-            errD_fake.backward();
-            let D_G_z1 = output.mean().item(); // TODO: verify
-            let errD = errD_real + errD_fake; // TODO: verify
-            optimizerD.step();
-            // (2) Update G network: maximize log(D(G(z)))
-            netG.zero_grad();
-            // TODO: label.fill_(real_label);
-            let output = netD.forward(&fake);
-            let errG = criterion.forward(&output, &label);
-            errG.backward();
-            let D_G_z2 = output.mean().item(); // TODO: verify
-            optimizerG.step();
-            println!("[{}/{}][{}/{}] Loss_D: {:.4} Loss_G: {:.4} D(x): {:.4} D(G(z)): {:.4} / {:.4}", epoch, opt.niter, i, len(dataloader), errD.item(), errG.item(), D_x, D_G_z1, D_G_z2);
+            let fake = net_g.forward(&noise);
+            let label = Variable::new(Tensor::full(&[batch_size], fake_label));
+            let output = net_d.forward(&fake.detach());
+            let err_d_fake = criterion.forward(&output, &label);
+            err_d_fake.backward();
+
+            optimizer_d.step();
+
+            // ============================
+            // (2) Update G: maximize log(D(G(z)))
+            // ============================
+            optimizer_g.zero_grad();
+            let label = Variable::new(Tensor::full(&[batch_size], real_label));
+            let output = net_d.forward(&fake);
+            let err_g = criterion.forward(&output, &label);
+            err_g.backward();
+            optimizer_g.step();
+
+            println!(
+                "[{}/{}][{}/{}] Training step complete",
+                epoch, niter, i, num_batches,
+            );
+
             if i % 100 == 0 {
-                // TODO: vutils.save_image(real_cpu, '%s/real_samples.png' % opt.outf, normalize=True) (torchvision has no Neo Theano equivalent)
-                let fake = netG.forward(&fixed_noise);
-                // TODO: vutils.save_image(fake.detach(), '%s/fake_samples_epoch_%03d.png' % (opt.outf, epoch), normalize=True) (torchvision has no Neo Theano equivalent)
+                let _fake = net_g.forward(&fixed_noise);
+                // TODO: save_image not available (torchvision equivalent needed)
             }
-            if opt.dry_run {
+
+            if args.dry_run {
                 break;
-                // do checkpointing
             }
         }
-        let _bytes = theano_serialize::save_state_dict(&netG.state_dict());
-    std::fs::write(format!("{}/netG_epoch_{}.pth", opt.outf, epoch), _bytes).expect("failed to save checkpoint");
-        let _bytes = theano_serialize::save_state_dict(&netD.state_dict());
-    std::fs::write(format!("{}/netD_epoch_{}.pth", opt.outf, epoch), _bytes).expect("failed to save checkpoint");
+
+        // Checkpointing
+        let bytes = save_state_dict(&net_g.state_dict());
+        std::fs::write(
+            format!("{}/netG_epoch_{}.pth", args.outf, epoch),
+            bytes,
+        )
+        .expect("failed to save generator checkpoint");
+
+        let bytes = save_state_dict(&net_d.state_dict());
+        std::fs::write(
+            format!("{}/netD_epoch_{}.pth", args.outf, epoch),
+            bytes,
+        )
+        .expect("failed to save discriminator checkpoint");
     }
 }
