@@ -661,10 +661,10 @@ fn infer_rust_type(value: &str) -> String {
         "Dropout".to_string()
     } else if value.contains("MaxPool2d") {
         "MaxPool2d".to_string()
-    } else if value.contains("AvgPool2d") {
-        "AvgPool2d".to_string()
     } else if value.contains("AdaptiveAvgPool2d") {
         "AdaptiveAvgPool2d".to_string()
+    } else if value.contains("AvgPool2d") {
+        "AvgPool2d".to_string()
     } else if value.contains("Embedding") {
         "Embedding".to_string()
     } else if value.contains("ReLU") {
@@ -1055,15 +1055,7 @@ fn translate_expression(py: &str, fields: &[(String, String)]) -> String {
         }
     }
 
-    // x.view(-1, N) -> x.reshape(&[-1, N]).unwrap()
-    let re_view = Regex::new(r"^(\w+)\.view\((.+)\)$").unwrap();
-    if let Some(caps) = re_view.captures(trimmed) {
-        let var = &caps[1];
-        let dims = &caps[2];
-        return format!("{}.reshape(&[{}]).unwrap()", var, dims);
-    }
-
-    // output.view(-1, 1).squeeze(1) pattern
+    // output.view(-1, 1).squeeze(1) pattern — must come before plain .view()
     if trimmed.contains(".view(") && trimmed.contains(".squeeze(") {
         let re = Regex::new(r"(\w+)\.view\(([^)]+)\)\.squeeze\((\d+)\)").unwrap();
         if let Some(caps) = re.captures(trimmed) {
@@ -1075,6 +1067,14 @@ fn translate_expression(py: &str, fields: &[(String, String)]) -> String {
                 shape
             );
         }
+    }
+
+    // x.view(-1, N) -> x.reshape(&[-1, N]).unwrap()
+    let re_view = Regex::new(r"^(\w+)\.view\((.+)\)$").unwrap();
+    if let Some(caps) = re_view.captures(trimmed) {
+        let var = &caps[1];
+        let dims = &caps[2];
+        return format!("{}.reshape(&[{}]).unwrap()", var, dims);
     }
 
     // x.relu() / x.sigmoid() / x.tanh()
@@ -1678,26 +1678,168 @@ fn translate_condition(py: &str) -> String {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Layer Construction — nn.* → Rust type constructors
+    // =========================================================================
+
     #[test]
-    fn test_translate_layer_construction() {
+    fn test_translate_layer_linear() {
         assert_eq!(
             translate_layer_construction("nn.Linear(784, 10)"),
             "Linear::new(784, 10)"
         );
         assert_eq!(
-            translate_layer_construction("nn.Conv2d(3, 64, 3, 1, 1, bias=False)"),
-            "Conv2d::with_options(3, 64, (3, 3), (1, 1), (1, 1), false)"
-        );
-        assert_eq!(
-            translate_layer_construction("nn.BatchNorm2d(64)"),
-            "BatchNorm1d::new(64)"
+            translate_layer_construction("nn.Linear(in_features, out_features)"),
+            "Linear::new(in_features, out_features)"
         );
     }
 
     #[test]
-    fn test_translate_expression() {
-        let fields = vec![("main".to_string(), "Sequential".to_string())];
+    fn test_translate_layer_conv2d() {
+        // Full args: in_ch, out_ch, kernel, stride, padding, bias
+        assert_eq!(
+            translate_layer_construction("nn.Conv2d(3, 64, 3, 1, 1, bias=False)"),
+            "Conv2d::with_options(3, 64, (3, 3), (1, 1), (1, 1), false)"
+        );
+        // bias=True
+        assert_eq!(
+            translate_layer_construction("nn.Conv2d(3, 64, 3, 1, 1, bias=True)"),
+            "Conv2d::with_options(3, 64, (3, 3), (1, 1), (1, 1), true)"
+        );
+        // Without bias kwarg (default true)
+        assert_eq!(
+            translate_layer_construction("nn.Conv2d(3, 64, 3, 1, 1)"),
+            "Conv2d::with_options(3, 64, (3, 3), (1, 1), (1, 1), true)"
+        );
+        // Only kernel size, no stride/padding
+        assert_eq!(
+            translate_layer_construction("nn.Conv2d(3, 64, 3)"),
+            "Conv2d::with_options(3, 64, (3, 3), (1, 1), (0, 0), true)"
+        );
+        // Expression args (ngf * 8)
+        assert_eq!(
+            translate_layer_construction("nn.Conv2d(nz, ngf * 8, 4, 1, 0, bias=False)"),
+            "Conv2d::with_options(nz, ngf * 8, (4, 4), (1, 1), (0, 0), false)"
+        );
+    }
 
+    #[test]
+    fn test_translate_layer_conv_transpose2d() {
+        // ConvTranspose2d falls back to Conv2d (with TODO in the code)
+        assert_eq!(
+            translate_layer_construction("nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False)"),
+            "Conv2d::with_options(nz, ngf * 8, (4, 4), (1, 1), (0, 0), false)"
+        );
+    }
+
+    #[test]
+    fn test_translate_layer_batchnorm() {
+        assert_eq!(
+            translate_layer_construction("nn.BatchNorm2d(64)"),
+            "BatchNorm1d::new(64)"
+        );
+        assert_eq!(
+            translate_layer_construction("nn.BatchNorm1d(128)"),
+            "BatchNorm1d::new(128)"
+        );
+        // Expression args
+        assert_eq!(
+            translate_layer_construction("nn.BatchNorm2d(ngf * 8)"),
+            "BatchNorm1d::new(ngf * 8)"
+        );
+    }
+
+    #[test]
+    fn test_translate_layer_dropout() {
+        assert_eq!(
+            translate_layer_construction("nn.Dropout(0.5)"),
+            "Dropout::new(0.5)"
+        );
+        assert_eq!(
+            translate_layer_construction("nn.Dropout(0.25)"),
+            "Dropout::new(0.25)"
+        );
+    }
+
+    #[test]
+    fn test_translate_layer_maxpool2d() {
+        assert_eq!(
+            translate_layer_construction("nn.MaxPool2d(2)"),
+            "MaxPool2d::new(2)"
+        );
+    }
+
+    #[test]
+    fn test_translate_layer_embedding() {
+        assert_eq!(
+            translate_layer_construction("nn.Embedding(10000, 256)"),
+            "Embedding::new(10000, 256)"
+        );
+        assert_eq!(
+            translate_layer_construction("nn.Embedding(vocab_size, embed_dim)"),
+            "Embedding::new(vocab_size, embed_dim)"
+        );
+    }
+
+    #[test]
+    fn test_translate_layer_activations() {
+        assert_eq!(translate_layer_construction("nn.ReLU(True)"), "ReLU");
+        assert_eq!(translate_layer_construction("nn.ReLU()"), "ReLU");
+        assert_eq!(translate_layer_construction("nn.ReLU"), "ReLU");
+        assert_eq!(translate_layer_construction("nn.Sigmoid()"), "Sigmoid");
+        assert_eq!(translate_layer_construction("nn.Tanh()"), "Tanh");
+    }
+
+    #[test]
+    fn test_translate_layer_leaky_relu() {
+        let result = translate_layer_construction("nn.LeakyReLU(0.2, inplace=True)");
+        assert!(result.contains("ReLU"));
+        assert!(result.contains("LeakyReLU(0.2)"));
+    }
+
+    #[test]
+    fn test_translate_layer_sequential_empty() {
+        assert_eq!(
+            translate_layer_construction("nn.Sequential()"),
+            "Sequential::new(vec![])"
+        );
+    }
+
+    #[test]
+    fn test_translate_layer_sequential_with_layers() {
+        let result = translate_layer_construction(
+            "nn.Sequential(nn.Linear(784, 256), nn.ReLU(), nn.Linear(256, 10))"
+        );
+        assert!(result.contains("Sequential::new(vec![])"));
+        assert!(result.contains(".add(Linear::new(784, 256))"));
+        assert!(result.contains(".add(ReLU)"));
+        assert!(result.contains(".add(Linear::new(256, 10))"));
+    }
+
+    #[test]
+    fn test_translate_layer_sequential_with_conv_layers() {
+        let result = translate_layer_construction(
+            "nn.Sequential(nn.Conv2d(3, 64, 3, 1, 1, bias=False), nn.BatchNorm2d(64), nn.ReLU(True))"
+        );
+        assert!(result.contains("Sequential::new(vec![])"));
+        assert!(result.contains(".add(Conv2d::with_options(3, 64, (3, 3), (1, 1), (1, 1), false))"));
+        assert!(result.contains(".add(BatchNorm1d::new(64))"));
+        assert!(result.contains(".add(ReLU)"));
+    }
+
+    #[test]
+    fn test_translate_layer_unknown_fallback() {
+        let result = translate_layer_construction("nn.TransformerEncoder(...)");
+        assert!(result.contains("TODO"));
+    }
+
+    // =========================================================================
+    // Expression Translation — tensor creation, ops, method calls
+    // =========================================================================
+
+    #[test]
+    fn test_translate_expression_self_forward() {
+        let fields = vec![("main".to_string(), "Sequential".to_string())];
         assert_eq!(
             translate_expression("self.main(input)", &fields),
             "self.main.forward(&input)"
@@ -1705,26 +1847,401 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_kwargs() {
+    fn test_translate_expression_self_layer_call() {
+        let fields = vec![
+            ("fc1".to_string(), "Linear".to_string()),
+            ("fc2".to_string(), "Linear".to_string()),
+        ];
         assert_eq!(
-            remove_kwargs("batch_size, nz, 1, 1, device=device"),
-            "batch_size, nz, 1, 1"
+            translate_expression("self.fc1(x)", &fields),
+            "self.fc1.forward(&x)"
+        );
+        assert_eq!(
+            translate_expression("self.fc2(x)", &fields),
+            "self.fc2.forward(&x)"
         );
     }
 
     #[test]
-    fn test_python_strings_to_rust() {
-        assert_eq!(python_strings_to_rust("'fake'"), "\"fake\"");
-        assert_eq!(python_strings_to_rust("''"), "\"\"");
-        assert_eq!(python_strings_to_rust("'imagenet'"), "\"imagenet\"");
-        // Preserve single-char in split() context
-        assert_eq!(python_strings_to_rust("split(',')"), "split(',')");
-        // Multi-word strings
+    fn test_translate_expression_non_field_call() {
+        let fields = vec![("fc1".to_string(), "Linear".to_string())];
+        // self.unknown_method should not match field-based forward translation
+        let result = translate_expression("self.unknown(x)", &fields);
+        assert!(result.contains("TODO") || !result.contains(".forward"));
+    }
+
+    #[test]
+    fn test_translate_expression_view() {
+        let fields: Vec<(String, String)> = vec![];
         assert_eq!(
-            python_strings_to_rust("'hello world'"),
-            "\"hello world\""
+            translate_expression("x.view(-1, 784)", &fields),
+            "x.reshape(&[-1, 784]).unwrap()"
+        );
+        assert_eq!(
+            translate_expression("x.view(batch_size, -1)", &fields),
+            "x.reshape(&[batch_size, -1]).unwrap()"
         );
     }
+
+    #[test]
+    fn test_translate_expression_view_squeeze_chain() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("output.view(-1, 1).squeeze(1)", &fields),
+            "output.reshape(&[-1, 1]).unwrap()"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_activations() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("x.relu()", &fields),
+            "x.relu().unwrap()"
+        );
+        assert_eq!(
+            translate_expression("x.sigmoid()", &fields),
+            "x.sigmoid().unwrap()"
+        );
+        assert_eq!(
+            translate_expression("x.tanh()", &fields),
+            "x.tanh().unwrap()"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_torch_randn() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("torch.randn(batch_size, nz, 1, 1)", &fields),
+            "Variable::new(Tensor::randn(&[batch_size, nz, 1, 1]))"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_torch_randn_with_device() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("torch.randn(batch_size, nz, 1, 1, device=device)", &fields),
+            "Variable::new(Tensor::randn(&[batch_size, nz, 1, 1]))"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_torch_zeros() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("torch.zeros(10, 20)", &fields),
+            "Variable::new(Tensor::zeros(&[10, 20]))"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_torch_ones() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("torch.ones(5)", &fields),
+            "Variable::new(Tensor::ones(&[5]))"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_torch_full() {
+        let fields: Vec<(String, String)> = vec![];
+        assert_eq!(
+            translate_expression("torch.full((batch_size,), 1.0)", &fields),
+            "Variable::new(Tensor::full(&[batch_size,], 1.0))"
+        );
+    }
+
+    #[test]
+    fn test_translate_expression_torch_full_with_device() {
+        let fields: Vec<(String, String)> = vec![];
+        let result = translate_expression("torch.full((batch_size,), 0.0, device=device)", &fields);
+        assert!(result.contains("Tensor::full"));
+        assert!(result.contains("batch_size"));
+        assert!(result.contains("0.0"));
+        // device kwarg should be stripped
+        assert!(!result.contains("device=device"));
+    }
+
+    // =========================================================================
+    // Statement Translation — assignment, control flow, training
+    // =========================================================================
+
+    #[test]
+    fn test_translate_statement_print() {
+        let result = translate_statement("print('hello')");
+        assert!(result.contains("println!"));
+        assert!(result.contains("\"hello\""));
+    }
+
+    #[test]
+    fn test_translate_statement_print_format_string() {
+        let result = translate_statement(
+            "print('[%d/%d] Loss_D: %.4f Loss_G: %.4f' % (epoch, niter, errD.item(), errG.item()))"
+        );
+        assert!(result.contains("println!"));
+        assert!(result.contains("{:.4}"));
+        assert!(result.contains("epoch"));
+    }
+
+    #[test]
+    fn test_translate_statement_model_instantiation() {
+        assert_eq!(
+            translate_statement("netG = Generator(ngpu)"),
+            "let netG = Generator::new(ngpu);"
+        );
+        assert_eq!(
+            translate_statement("netD = Discriminator(ngpu)"),
+            "let netD = Discriminator::new(ngpu);"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_model_with_to_device() {
+        assert_eq!(
+            translate_statement("model = MyNet(10).to(device)"),
+            "let model = MyNet::new(10);"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_loss_bce() {
+        assert_eq!(
+            translate_statement("criterion = nn.BCELoss()"),
+            "let criterion = BCELoss::new();"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_loss_mse() {
+        assert_eq!(
+            translate_statement("criterion = nn.MSELoss()"),
+            "let criterion = MSELoss::new();"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_loss_cross_entropy() {
+        assert_eq!(
+            translate_statement("criterion = nn.CrossEntropyLoss()"),
+            "let criterion = CrossEntropyLoss::new();"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_optim_adam() {
+        let result = translate_statement(
+            "optimizerG = optim.Adam(netG.parameters(), lr=0.0002, betas=(0.5, 0.999))"
+        );
+        assert!(result.contains("let mut optimizerG = Adam::new(netG.parameters(), 0.0002)"));
+        assert!(result.contains(".betas(0.5, 0.999)"));
+    }
+
+    #[test]
+    fn test_translate_statement_optim_sgd() {
+        let result = translate_statement(
+            "optimizer = optim.SGD(model.parameters(), lr=0.01)"
+        );
+        assert!(result.contains("let mut optimizer = SGD::new(model.parameters(), 0.01)"));
+    }
+
+    #[test]
+    fn test_translate_statement_backward() {
+        assert_eq!(
+            translate_statement("errD.backward()"),
+            "errD.backward();"
+        );
+        assert_eq!(
+            translate_statement("loss.backward()"),
+            "loss.backward();"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_optimizer_step() {
+        assert_eq!(
+            translate_statement("optimizer.step()"),
+            "optimizer.step();"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_zero_grad() {
+        assert_eq!(
+            translate_statement("optimizer.zero_grad()"),
+            "optimizer.zero_grad();"
+        );
+        assert_eq!(
+            translate_statement("netD.zero_grad()"),
+            "netD.zero_grad();"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_for_range() {
+        assert_eq!(
+            translate_statement("for epoch in range(niter):"),
+            "for epoch in 0..niter {"
+        );
+        assert_eq!(
+            translate_statement("for i in range(100):"),
+            "for i in 0..100 {"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_for_enumerate() {
+        assert_eq!(
+            translate_statement("for i, data in enumerate(dataloader, 0):"),
+            "for (i, data) in dataloader.iter().enumerate() {"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_if_condition() {
+        assert_eq!(
+            translate_statement("if epoch > 10:"),
+            "if epoch > 10 {"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_elif() {
+        assert_eq!(
+            translate_statement("elif x > 5:"),
+            "} else if x > 5 {"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_else() {
+        assert_eq!(
+            translate_statement("else:"),
+            "} else {"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_break() {
+        assert_eq!(translate_statement("break"), "break;");
+    }
+
+    #[test]
+    fn test_translate_statement_assert() {
+        assert_eq!(
+            translate_statement("assert x > 0"),
+            "assert!(x > 0);"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_torch_randn_assignment() {
+        let result = translate_statement(
+            "noise = torch.randn(batch_size, nz, 1, 1, device=device)"
+        );
+        assert!(result.contains("let noise = Variable::new(Tensor::randn(&[batch_size, nz, 1, 1]))"));
+        assert!(!result.contains("device=device"));
+    }
+
+    #[test]
+    fn test_translate_statement_torch_full_assignment() {
+        let result = translate_statement(
+            "label = torch.full((batch_size,), 1.0, device=device)"
+        );
+        assert!(result.contains("let label = Variable::new(Tensor::full(&[batch_size,], 1.0))"));
+    }
+
+    #[test]
+    fn test_translate_statement_int_cast() {
+        assert_eq!(
+            translate_statement("n = int(x)"),
+            "let n = x as usize;"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_numeric_literal() {
+        assert_eq!(
+            translate_statement("lr = 0.001"),
+            "let lr = 0.001;"
+        );
+        assert_eq!(
+            translate_statement("batch_size = 64"),
+            "let batch_size = 64;"
+        );
+    }
+
+    #[test]
+    fn test_translate_statement_model_forward_call() {
+        let result = translate_statement("output = netD(real)");
+        assert!(result.contains("let output = netD.forward(&real)"));
+    }
+
+    #[test]
+    fn test_translate_statement_criterion_call() {
+        let result = translate_statement("errD_real = criterion(output, label)");
+        assert!(result.contains("let errD_real = criterion.forward(&output, &label)"));
+    }
+
+    #[test]
+    fn test_translate_statement_torch_save() {
+        let result = translate_statement(
+            "torch.save(netG.state_dict(), 'checkpoint.pt')"
+        );
+        assert!(result.contains("theano_serialize::save_state_dict(&netG.state_dict())"));
+        assert!(result.contains("std::fs::write"));
+    }
+
+    #[test]
+    fn test_translate_statement_torch_load() {
+        let result = translate_statement(
+            "netG.load_state_dict(torch.load('checkpoint.pt'))"
+        );
+        assert!(result.contains("theano_serialize::load_state_dict"));
+        assert!(result.contains("std::fs::read"));
+    }
+
+    #[test]
+    fn test_translate_statement_model_apply() {
+        let result = translate_statement("netG.apply(weights_init)");
+        assert!(result.contains("TODO"));
+    }
+
+    #[test]
+    fn test_translate_statement_pass() {
+        assert_eq!(translate_statement("pass"), "");
+    }
+
+    #[test]
+    fn test_translate_statement_from_future() {
+        assert_eq!(translate_statement("from __future__ import print_function"), "");
+    }
+
+    #[test]
+    fn test_translate_statement_try_except() {
+        assert!(translate_statement("try:").contains("TODO"));
+        assert!(translate_statement("except Exception as e:").contains("TODO"));
+        assert!(translate_statement("raise ValueError('error')").contains("TODO"));
+    }
+
+    #[test]
+    fn test_translate_statement_torchvision_call() {
+        let result = translate_statement("vutils.save_image(fake, 'output.png')");
+        assert!(result.contains("TODO"));
+        assert!(result.contains("torchvision"));
+    }
+
+    #[test]
+    fn test_translate_statement_fill_() {
+        let result = translate_statement("label.fill_(1.0)");
+        assert!(result.contains("TODO"));
+    }
+
+    // =========================================================================
+    // Condition Translation — boolean operators, comparisons
+    // =========================================================================
 
     #[test]
     fn test_translate_condition_in_list() {
@@ -1734,13 +2251,1383 @@ mod tests {
 
     #[test]
     fn test_translate_condition_string_comparison() {
-        let result = translate_condition("opt.dataset == 'fake'");
-        assert_eq!(result, "opt.dataset == \"fake\"");
+        assert_eq!(
+            translate_condition("opt.dataset == 'fake'"),
+            "opt.dataset == \"fake\""
+        );
     }
 
     #[test]
     fn test_translate_condition_empty_string() {
-        let result = translate_condition("opt.netG != ''");
-        assert_eq!(result, "opt.netG != \"\"");
+        assert_eq!(
+            translate_condition("opt.netG != ''"),
+            "opt.netG != \"\""
+        );
+    }
+
+    #[test]
+    fn test_translate_condition_and() {
+        let result = translate_condition("x > 0 and y > 0");
+        assert_eq!(result, "x > 0 && y > 0");
+    }
+
+    #[test]
+    fn test_translate_condition_or() {
+        let result = translate_condition("x > 0 or y > 0");
+        assert_eq!(result, "x > 0 || y > 0");
+    }
+
+    #[test]
+    fn test_translate_condition_is_none() {
+        assert_eq!(
+            translate_condition("x is None"),
+            "x.is_none()"
+        );
+    }
+
+    #[test]
+    fn test_translate_condition_is_not_none() {
+        assert_eq!(
+            translate_condition("x is not None"),
+            "x.is_some()"
+        );
+    }
+
+    #[test]
+    fn test_translate_condition_true_false() {
+        assert_eq!(translate_condition("True"), "true");
+        assert_eq!(translate_condition("False"), "false");
+    }
+
+    #[test]
+    fn test_translate_condition_not() {
+        let result = translate_condition("x not in list");
+        assert!(result.contains("!"));
+    }
+
+    #[test]
+    fn test_translate_condition_compound() {
+        let result = translate_condition("x > 0 and y is not None or z == 'test'");
+        assert!(result.contains("&&"));
+        assert!(result.contains(".is_some()"));
+        assert!(result.contains("||"));
+        assert!(result.contains("\"test\""));
+    }
+
+    // =========================================================================
+    // Python Strings to Rust — quote conversion
+    // =========================================================================
+
+    #[test]
+    fn test_python_strings_to_rust_basic() {
+        assert_eq!(python_strings_to_rust("'fake'"), "\"fake\"");
+        assert_eq!(python_strings_to_rust("''"), "\"\"");
+        assert_eq!(python_strings_to_rust("'imagenet'"), "\"imagenet\"");
+    }
+
+    #[test]
+    fn test_python_strings_to_rust_multiword() {
+        assert_eq!(
+            python_strings_to_rust("'hello world'"),
+            "\"hello world\""
+        );
+    }
+
+    #[test]
+    fn test_python_strings_to_rust_split_context() {
+        assert_eq!(python_strings_to_rust("split(',')"), "split(',')");
+        assert_eq!(python_strings_to_rust("find(':')"), "find(':')");
+    }
+
+    #[test]
+    fn test_python_strings_to_rust_double_quotes_unchanged() {
+        assert_eq!(python_strings_to_rust("\"hello\""), "\"hello\"");
+    }
+
+    #[test]
+    fn test_python_strings_to_rust_mixed_content() {
+        let result = python_strings_to_rust("x == 'test' and y == 'foo'");
+        assert_eq!(result, "x == \"test\" and y == \"foo\"");
+    }
+
+    #[test]
+    fn test_python_strings_to_rust_escaped_quote() {
+        let result = python_strings_to_rust("'it\\'s a test'");
+        assert!(result.contains("\"it\\'s a test\""));
+    }
+
+    #[test]
+    fn test_python_strings_to_rust_no_quotes() {
+        assert_eq!(python_strings_to_rust("x + y"), "x + y");
+    }
+
+    // =========================================================================
+    // Format String Translation — Python % format → Rust format!()
+    // =========================================================================
+
+    #[test]
+    fn test_translate_format_string_pct_tuple() {
+        let result = translate_python_format_string("'%s/model_%d.pt' % (outf, epoch)");
+        assert_eq!(result, "format!(\"{}/model_{}.pt\", outf, epoch)");
+    }
+
+    #[test]
+    fn test_translate_format_string_pct_single() {
+        let result = translate_python_format_string("'checkpoint_%d.pt' % epoch");
+        assert_eq!(result, "format!(\"checkpoint_{}.pt\", epoch)");
+    }
+
+    #[test]
+    fn test_translate_format_string_float_precision() {
+        let result = translate_python_format_string("'loss: %.4f' % loss_val");
+        assert_eq!(result, "format!(\"loss: {:.4}\", loss_val)");
+    }
+
+    #[test]
+    fn test_translate_format_string_no_pattern() {
+        // Non-format strings should pass through python_strings_to_rust
+        let result = translate_python_format_string("'checkpoint.pt'");
+        assert_eq!(result, "\"checkpoint.pt\"");
+    }
+
+    #[test]
+    fn test_translate_format_string_multiple_specifiers() {
+        let result = translate_python_format_string(
+            "'%s/epoch_%d_loss_%.4f.pt' % (outf, epoch, loss)"
+        );
+        assert_eq!(result, "format!(\"{}/epoch_{}_loss_{:.4}.pt\", outf, epoch, loss)");
+    }
+
+    // =========================================================================
+    // Remove Kwargs — strip keyword arguments from function calls
+    // =========================================================================
+
+    #[test]
+    fn test_remove_kwargs_device() {
+        assert_eq!(
+            remove_kwargs("batch_size, nz, 1, 1, device=device"),
+            "batch_size, nz, 1, 1"
+        );
+    }
+
+    #[test]
+    fn test_remove_kwargs_multiple() {
+        assert_eq!(
+            remove_kwargs("10, 20, device=cuda, dtype=float32"),
+            "10, 20"
+        );
+    }
+
+    #[test]
+    fn test_remove_kwargs_no_kwargs() {
+        assert_eq!(
+            remove_kwargs("10, 20, 30"),
+            "10, 20, 30"
+        );
+    }
+
+    #[test]
+    fn test_remove_kwargs_only_kwargs() {
+        assert_eq!(
+            remove_kwargs("device=cuda"),
+            ""
+        );
+    }
+
+    // =========================================================================
+    // Forward Body Translation — nn.Module forward methods
+    // =========================================================================
+
+    #[test]
+    fn test_translate_forward_simple_return() {
+        let method = PyMethod {
+            name: "forward".to_string(),
+            args: vec!["self".to_string(), "x".to_string()],
+            body: vec!["return self.fc(x)".to_string()],
+            line: 1,
+        };
+        let fields = vec![("fc".to_string(), "Linear".to_string())];
+        let result = translate_forward_body(&method, &fields);
+        assert!(result.iter().any(|l| l.contains("self.fc.forward")));
+    }
+
+    #[test]
+    fn test_translate_forward_two_lines() {
+        let method = PyMethod {
+            name: "forward".to_string(),
+            args: vec!["self".to_string(), "x".to_string()],
+            body: vec![
+                "x = self.fc1(x)".to_string(),
+                "return self.fc2(x)".to_string(),
+            ],
+            line: 1,
+        };
+        let fields = vec![
+            ("fc1".to_string(), "Linear".to_string()),
+            ("fc2".to_string(), "Linear".to_string()),
+        ];
+        let result = translate_forward_body(&method, &fields);
+        assert!(result.iter().any(|l| l.contains("self.fc1.forward")));
+        assert!(result.iter().any(|l| l.contains("self.fc2.forward")));
+    }
+
+    #[test]
+    fn test_translate_forward_with_data_parallel() {
+        let method = PyMethod {
+            name: "forward".to_string(),
+            args: vec!["self".to_string(), "input".to_string()],
+            body: vec![
+                "if input.is_cuda and self.ngpu > 1:".to_string(),
+                "    output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))".to_string(),
+                "else:".to_string(),
+                "    output = self.main(input)".to_string(),
+                "return output".to_string(),
+            ],
+            line: 1,
+        };
+        let fields = vec![("main".to_string(), "Sequential".to_string())];
+        let result = translate_forward_body(&method, &fields);
+        // Should simplify data_parallel to just self.main.forward
+        assert!(result.iter().any(|l| l.contains("self.main.forward")));
+    }
+
+    #[test]
+    fn test_translate_forward_with_view_squeeze() {
+        let method = PyMethod {
+            name: "forward".to_string(),
+            args: vec!["self".to_string(), "input".to_string()],
+            body: vec![
+                "if input.is_cuda and self.ngpu > 1:".to_string(),
+                "    output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))".to_string(),
+                "else:".to_string(),
+                "    output = self.main(input)".to_string(),
+                "return output.view(-1, 1).squeeze(1)".to_string(),
+            ],
+            line: 1,
+        };
+        let fields = vec![("main".to_string(), "Sequential".to_string())];
+        let result = translate_forward_body(&method, &fields);
+        // Should contain reshape
+        assert!(result.iter().any(|l| l.contains("reshape")));
+    }
+
+    // =========================================================================
+    // Forward Statement Translation
+    // =========================================================================
+
+    #[test]
+    fn test_translate_forward_statement_return() {
+        let fields = vec![("fc".to_string(), "Linear".to_string())];
+        let result = translate_forward_statement("return self.fc(x)", &fields);
+        assert_eq!(result, "self.fc.forward(&x)");
+    }
+
+    #[test]
+    fn test_translate_forward_statement_assignment() {
+        let fields = vec![("conv".to_string(), "Conv2d".to_string())];
+        let result = translate_forward_statement("x = self.conv(input)", &fields);
+        assert_eq!(result, "let x = self.conv.forward(&input);");
+    }
+
+    #[test]
+    fn test_translate_forward_statement_fallback() {
+        let fields: Vec<(String, String)> = vec![];
+        let result = translate_forward_statement("x = something_unknown()", &fields);
+        assert!(result.contains("TODO") || result.contains("let x"));
+    }
+
+    // =========================================================================
+    // Module Struct Generation — full class → struct + impl
+    // =========================================================================
+
+    #[test]
+    fn test_generate_module_struct_simple() {
+        let class = PyClass {
+            name: "SimpleNet".to_string(),
+            bases: vec!["nn.Module".to_string()],
+            methods: vec![
+                PyMethod {
+                    name: "__init__".to_string(),
+                    args: vec!["self".to_string()],
+                    body: vec![
+                        "super().__init__()".to_string(),
+                        "self.fc = nn.Linear(784, 10)".to_string(),
+                    ],
+                    line: 1,
+                },
+                PyMethod {
+                    name: "forward".to_string(),
+                    args: vec!["self".to_string(), "x".to_string()],
+                    body: vec!["return self.fc(x)".to_string()],
+                    line: 5,
+                },
+            ],
+            body_lines: vec![],
+            line: 1,
+        };
+        let mut changes = Vec::new();
+        let result = generate_module_struct(&class, &mut changes, "test.py");
+
+        assert!(result.contains("struct SimpleNet"));
+        assert!(result.contains("fc: Linear"));
+        assert!(result.contains("impl SimpleNet"));
+        assert!(result.contains("fn new("));
+        assert!(result.contains("impl Module for SimpleNet"));
+        assert!(result.contains("fn forward(&self, input: &Variable) -> Variable"));
+        assert!(result.contains("fn parameters(&self) -> Vec<Variable>"));
+    }
+
+    #[test]
+    fn test_generate_module_struct_multi_layer() {
+        let class = PyClass {
+            name: "TwoLayerNet".to_string(),
+            bases: vec!["nn.Module".to_string()],
+            methods: vec![
+                PyMethod {
+                    name: "__init__".to_string(),
+                    args: vec!["self".to_string(), "input_size".to_string(), "hidden_size".to_string()],
+                    body: vec![
+                        "super().__init__()".to_string(),
+                        "self.fc1 = nn.Linear(input_size, hidden_size)".to_string(),
+                        "self.fc2 = nn.Linear(hidden_size, 10)".to_string(),
+                    ],
+                    line: 1,
+                },
+                PyMethod {
+                    name: "forward".to_string(),
+                    args: vec!["self".to_string(), "x".to_string()],
+                    body: vec![
+                        "x = self.fc1(x)".to_string(),
+                        "return self.fc2(x)".to_string(),
+                    ],
+                    line: 6,
+                },
+            ],
+            body_lines: vec![],
+            line: 1,
+        };
+        let mut changes = Vec::new();
+        let result = generate_module_struct(&class, &mut changes, "test.py");
+
+        assert!(result.contains("fc1: Linear"));
+        assert!(result.contains("fc2: Linear"));
+        assert!(result.contains("fn new(input_size: usize, hidden_size: usize)"));
+        // Parameters should combine both layers
+        assert!(result.contains("self.fc1.parameters()"));
+        assert!(result.contains("self.fc2.parameters()"));
+    }
+
+    #[test]
+    fn test_generate_module_struct_no_forward() {
+        let class = PyClass {
+            name: "Stub".to_string(),
+            bases: vec!["nn.Module".to_string()],
+            methods: vec![
+                PyMethod {
+                    name: "__init__".to_string(),
+                    args: vec!["self".to_string()],
+                    body: vec!["super().__init__()".to_string()],
+                    line: 1,
+                },
+            ],
+            body_lines: vec![],
+            line: 1,
+        };
+        let mut changes = Vec::new();
+        let result = generate_module_struct(&class, &mut changes, "test.py");
+        // Should have a TODO placeholder for forward
+        assert!(result.contains("TODO: implement forward pass"));
+    }
+
+    // =========================================================================
+    // Cargo.toml Generation — dependency detection
+    // =========================================================================
+
+    #[test]
+    fn test_generate_cargo_toml_basic() {
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_cargo_toml_named(&files, "my_project");
+
+        assert!(result.contains("name = \"my_project\""));
+        assert!(result.contains("theano"));
+        assert!(result.contains("edition = \"2021\""));
+    }
+
+    #[test]
+    fn test_generate_cargo_toml_with_argparse() {
+        let pyfile = PyFile {
+            imports: vec![PyImport {
+                kind: ImportKind::Import,
+                module: "argparse".to_string(),
+                names: vec![],
+                alias: None,
+                line: 1,
+            }],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_cargo_toml_named(&files, "test_proj");
+
+        assert!(result.contains("clap"));
+    }
+
+    #[test]
+    fn test_generate_cargo_toml_with_random() {
+        let pyfile = PyFile {
+            imports: vec![PyImport {
+                kind: ImportKind::Import,
+                module: "random".to_string(),
+                names: vec![],
+                alias: None,
+                line: 1,
+            }],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_cargo_toml_named(&files, "test_proj");
+
+        assert!(result.contains("rand"));
+    }
+
+    #[test]
+    fn test_generate_cargo_toml_with_save_load() {
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![PyStatement {
+                text: "torch.save(model.state_dict(), 'model.pt')".to_string(),
+                line: 10,
+            }],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_cargo_toml_named(&files, "test_proj");
+
+        assert!(result.contains("theano-serialize"));
+    }
+
+    // =========================================================================
+    // Type Inference — Python layer → Rust type
+    // =========================================================================
+
+    #[test]
+    fn test_infer_rust_type_all_layers() {
+        assert_eq!(infer_rust_type("nn.Sequential(...)"), "Sequential");
+        assert_eq!(infer_rust_type("nn.Conv2d(3, 64, 3)"), "Conv2d");
+        assert_eq!(infer_rust_type("nn.Conv1d(3, 64, 3)"), "Conv1d");
+        assert_eq!(infer_rust_type("nn.ConvTranspose2d(...)"), "Conv2d"); // fallback
+        assert_eq!(infer_rust_type("nn.Linear(784, 10)"), "Linear");
+        assert_eq!(infer_rust_type("nn.BatchNorm2d(64)"), "BatchNorm1d");
+        assert_eq!(infer_rust_type("nn.BatchNorm1d(64)"), "BatchNorm1d");
+        assert_eq!(infer_rust_type("nn.Dropout(0.5)"), "Dropout");
+        assert_eq!(infer_rust_type("nn.MaxPool2d(2)"), "MaxPool2d");
+        assert_eq!(infer_rust_type("nn.AvgPool2d(2)"), "AvgPool2d");
+        assert_eq!(infer_rust_type("nn.AdaptiveAvgPool2d(1)"), "AdaptiveAvgPool2d");
+        assert_eq!(infer_rust_type("nn.Embedding(10000, 256)"), "Embedding");
+        assert_eq!(infer_rust_type("nn.ReLU()"), "ReLU");
+        assert_eq!(infer_rust_type("nn.Sigmoid()"), "Sigmoid");
+        assert_eq!(infer_rust_type("nn.Tanh()"), "Tanh");
+    }
+
+    #[test]
+    fn test_infer_rust_type_unknown() {
+        let result = infer_rust_type("nn.SomeUnknownLayer(...)");
+        assert!(result.contains("TODO"));
+    }
+
+    // =========================================================================
+    // Layer Detection — is_layer_construction
+    // =========================================================================
+
+    #[test]
+    fn test_is_layer_construction_positive() {
+        assert!(is_layer_construction("nn.Linear(784, 10)"));
+        assert!(is_layer_construction("nn.Conv2d(3, 64, 3)"));
+        assert!(is_layer_construction("nn.Conv1d(3, 64, 3)"));
+        assert!(is_layer_construction("nn.ConvTranspose2d(nz, ngf * 8, 4)"));
+        assert!(is_layer_construction("nn.BatchNorm2d(64)"));
+        assert!(is_layer_construction("nn.Sequential(nn.Linear(1, 2))"));
+        assert!(is_layer_construction("nn.Dropout(0.5)"));
+        assert!(is_layer_construction("nn.Embedding(10000, 256)"));
+        assert!(is_layer_construction("nn.MaxPool2d(2)"));
+        assert!(is_layer_construction("nn.AvgPool2d(2)"));
+        assert!(is_layer_construction("nn.AdaptiveAvgPool2d(1)"));
+        assert!(is_layer_construction("torch.nn.Linear(10, 20)"));
+    }
+
+    #[test]
+    fn test_is_layer_construction_negative() {
+        assert!(!is_layer_construction("ngpu"));
+        assert!(!is_layer_construction("x + y"));
+        assert!(!is_layer_construction("0.5"));
+        assert!(!is_layer_construction("some_function()"));
+    }
+
+    // =========================================================================
+    // Extract Layer Fields
+    // =========================================================================
+
+    #[test]
+    fn test_extract_layer_fields() {
+        let init = PyMethod {
+            name: "__init__".to_string(),
+            args: vec!["self".to_string()],
+            body: vec![
+                "super().__init__()".to_string(),
+                "self.ngpu = ngpu".to_string(), // should be skipped (not a layer)
+                "self.fc = nn.Linear(784, 10)".to_string(),
+                "self.conv = nn.Conv2d(3, 64, 3)".to_string(),
+            ],
+            line: 1,
+        };
+        let fields = extract_layer_fields(&init);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "fc");
+        assert_eq!(fields[0].1, "Linear");
+        assert_eq!(fields[1].0, "conv");
+        assert_eq!(fields[1].1, "Conv2d");
+    }
+
+    #[test]
+    fn test_extract_layer_fields_skips_scalars() {
+        let init = PyMethod {
+            name: "__init__".to_string(),
+            args: vec!["self".to_string()],
+            body: vec![
+                "super().__init__()".to_string(),
+                "self.num_classes = num_classes".to_string(),
+                "self.hidden_size = 256".to_string(),
+            ],
+            line: 1,
+        };
+        let fields = extract_layer_fields(&init);
+        assert_eq!(fields.len(), 0);
+    }
+
+    // =========================================================================
+    // Join Multiline Expressions
+    // =========================================================================
+
+    #[test]
+    fn test_join_multiline_single_line() {
+        let lines = vec!["x = 10".to_string()];
+        let result = join_multiline_exprs(&lines);
+        assert_eq!(result, vec!["x = 10"]);
+    }
+
+    #[test]
+    fn test_join_multiline_continuation() {
+        let lines = vec![
+            "self.main = nn.Sequential(".to_string(),
+            "    nn.Linear(784, 256),".to_string(),
+            "    nn.ReLU(),".to_string(),
+            ")".to_string(),
+        ];
+        let result = join_multiline_exprs(&lines);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("nn.Sequential("));
+        assert!(result[0].contains("nn.Linear(784, 256)"));
+        assert!(result[0].contains("nn.ReLU()"));
+    }
+
+    #[test]
+    fn test_join_multiline_nested_parens() {
+        let lines = vec![
+            "self.main = nn.Sequential(".to_string(),
+            "    nn.Conv2d(3, 64, 3, 1, 1),".to_string(),
+            "    nn.BatchNorm2d(64),".to_string(),
+            "    nn.ReLU(True),".to_string(),
+            ")".to_string(),
+        ];
+        let result = join_multiline_exprs(&lines);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_join_multiline_with_comments() {
+        let lines = vec![
+            "self.main = nn.Sequential(".to_string(),
+            "    nn.Linear(784, 256), # first layer".to_string(),
+            "    nn.ReLU(), # activation".to_string(),
+            ")".to_string(),
+        ];
+        let result = join_multiline_exprs(&lines);
+        assert_eq!(result.len(), 1);
+        // Comments should be stripped
+        assert!(!result[0].contains('#'));
+    }
+
+    // =========================================================================
+    // Strip Line Comments
+    // =========================================================================
+
+    #[test]
+    fn test_strip_line_comment_basic() {
+        assert_eq!(strip_line_comment("x = 10 # comment"), "x = 10");
+    }
+
+    #[test]
+    fn test_strip_line_comment_in_string() {
+        assert_eq!(
+            strip_line_comment("x = '#not a comment'"),
+            "x = '#not a comment'"
+        );
+    }
+
+    #[test]
+    fn test_strip_line_comment_no_comment() {
+        assert_eq!(strip_line_comment("x = 10"), "x = 10");
+    }
+
+    #[test]
+    fn test_strip_line_comment_full_line() {
+        assert_eq!(strip_line_comment("# just a comment"), "");
+    }
+
+    // =========================================================================
+    // Strip Inline Comments
+    // =========================================================================
+
+    #[test]
+    fn test_strip_inline_comments_multiline() {
+        let input = "nn.Linear(10, 20), # first\nnn.ReLU() # second";
+        let result = strip_inline_comments(input);
+        assert!(!result.contains("first"));
+        assert!(!result.contains("second"));
+        assert!(result.contains("nn.Linear(10, 20)"));
+        assert!(result.contains("nn.ReLU()"));
+    }
+
+    // =========================================================================
+    // Argparse Extraction
+    // =========================================================================
+
+    #[test]
+    fn test_extract_argparse_args_basic() {
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![
+                PyStatement {
+                    text: "parser = argparse.ArgumentParser()".to_string(),
+                    line: 1,
+                },
+                PyStatement {
+                    text: "parser.add_argument('--lr', type=float, default=0.001, help='learning rate')".to_string(),
+                    line: 2,
+                },
+                PyStatement {
+                    text: "parser.add_argument('--epochs', type=int, default=10, help='number of epochs')".to_string(),
+                    line: 3,
+                },
+            ],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let args = extract_argparse_args(&files);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].rust_name, "lr");
+        assert_eq!(args[0].arg_type, "float");
+        assert_eq!(args[0].default, Some("0.001".to_string()));
+        assert_eq!(args[0].help, Some("learning rate".to_string()));
+        assert_eq!(args[1].rust_name, "epochs");
+        assert_eq!(args[1].arg_type, "int");
+    }
+
+    #[test]
+    fn test_extract_argparse_flag() {
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![PyStatement {
+                text: "parser.add_argument('--dry-run', action='store_true', help='run without saving')".to_string(),
+                line: 1,
+            }],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let args = extract_argparse_args(&files);
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].rust_name, "dry_run"); // hyphen → underscore
+        assert!(args[0].is_flag);
+        assert_eq!(args[0].default, Some("false".to_string()));
+    }
+
+    #[test]
+    fn test_extract_argparse_string_default() {
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![PyStatement {
+                text: "parser.add_argument('--outf', default='output', help='output folder')".to_string(),
+                line: 1,
+            }],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let args = extract_argparse_args(&files);
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].default, Some("\"output\"".to_string()));
+    }
+
+    // =========================================================================
+    // Rust Default Value Conversion
+    // =========================================================================
+
+    #[test]
+    fn test_rust_default_value_bool() {
+        assert_eq!(rust_default_value("false", "bool"), "false");
+        assert_eq!(rust_default_value("true", "bool"), "true");
+    }
+
+    #[test]
+    fn test_rust_default_value_int() {
+        assert_eq!(rust_default_value("42", "int"), "42");
+    }
+
+    #[test]
+    fn test_rust_default_value_float() {
+        assert_eq!(rust_default_value("0.001", "float"), "0.001");
+        // Integer value for float type gets .0 appended
+        assert_eq!(rust_default_value("1", "float"), "1.0");
+    }
+
+    #[test]
+    fn test_rust_default_value_string() {
+        assert_eq!(
+            rust_default_value("\"output\"", "str"),
+            "\"output\".into()"
+        );
+        assert_eq!(
+            rust_default_value("String::new()", "str"),
+            "String::new().into()"
+        );
+    }
+
+    // =========================================================================
+    // Translate Args — adding & references
+    // =========================================================================
+
+    #[test]
+    fn test_translate_args_variables() {
+        assert_eq!(translate_args("x"), "&x");
+        assert_eq!(translate_args("x, y"), "&x, &y");
+    }
+
+    #[test]
+    fn test_translate_args_literals() {
+        // Numbers should not get & prefix
+        assert_eq!(translate_args("3.14"), "3.14");
+        assert_eq!(translate_args("42"), "42");
+    }
+
+    #[test]
+    fn test_translate_args_already_referenced() {
+        assert_eq!(translate_args("&x"), "&x");
+    }
+
+    #[test]
+    fn test_translate_args_string_literal() {
+        assert_eq!(translate_args("\"hello\""), "\"hello\"");
+    }
+
+    // =========================================================================
+    // Generate Function — standalone Python functions
+    // =========================================================================
+
+    #[test]
+    fn test_generate_function_no_args() {
+        let func = PyFunction {
+            name: "setup".to_string(),
+            args: vec![],
+            body: vec!["print('hello')".to_string()],
+            line: 1,
+        };
+        let result = generate_function(&func);
+        assert!(result.contains("fn setup()"));
+    }
+
+    #[test]
+    fn test_generate_function_with_args() {
+        let func = PyFunction {
+            name: "weights_init".to_string(),
+            args: vec!["m".to_string()],
+            body: vec![
+                "classname = m.__class__.__name__".to_string(),
+                "if classname.find('Conv') != -1:".to_string(),
+            ],
+            line: 1,
+        };
+        let result = generate_function(&func);
+        assert!(result.contains("fn weights_init(m: /* TODO */)"));
+        assert!(result.contains("// TODO:"));
+    }
+
+    // =========================================================================
+    // Split Sequential Args
+    // =========================================================================
+
+    #[test]
+    fn test_split_sequential_args_simple() {
+        let args = split_sequential_args("nn.Linear(10, 20), nn.ReLU()");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "nn.Linear(10, 20)");
+        assert_eq!(args[1], "nn.ReLU()");
+    }
+
+    #[test]
+    fn test_split_sequential_args_nested() {
+        let args = split_sequential_args(
+            "nn.Conv2d(3, 64, 3, 1, 1), nn.BatchNorm2d(64), nn.ReLU(True)"
+        );
+        assert_eq!(args.len(), 3);
+        assert!(args[0].contains("Conv2d"));
+        assert!(args[1].contains("BatchNorm2d"));
+        assert!(args[2].contains("ReLU"));
+    }
+
+    #[test]
+    fn test_split_sequential_args_with_comments() {
+        let args = split_sequential_args(
+            "nn.Linear(10, 20), # layer 1\nnn.ReLU() # activation"
+        );
+        assert_eq!(args.len(), 2);
+    }
+
+    // =========================================================================
+    // Main.rs Generation — full pipeline integration
+    // =========================================================================
+
+    #[test]
+    fn test_generate_main_rs_use_statements() {
+        let import_analysis = ImportAnalysis {
+            uses_torch: true,
+            uses_nn: true,
+            uses_optim: true,
+            uses_data: true,
+            uses_functional: false,
+            torchvision_imports: vec![],
+            unsupported_imports: vec![],
+        };
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let mut changes = Vec::new();
+        let result = generate_main_rs(&files, &import_analysis, &mut changes);
+
+        assert!(result.contains("use theano::prelude::*;"));
+        assert!(result.contains("use theano::nn::*;"));
+        assert!(result.contains("use theano::optim::{Adam, SGD, Optimizer};"));
+        assert!(result.contains("use theano_types::Device;"));
+    }
+
+    #[test]
+    fn test_generate_main_rs_with_save_load_imports() {
+        let import_analysis = ImportAnalysis {
+            uses_torch: false,
+            uses_nn: false,
+            uses_optim: false,
+            uses_data: false,
+            uses_functional: false,
+            torchvision_imports: vec![],
+            unsupported_imports: vec![],
+        };
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![PyStatement {
+                text: "torch.save(model.state_dict(), 'model.pt')".to_string(),
+                line: 1,
+            }],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let mut changes = Vec::new();
+        let result = generate_main_rs(&files, &import_analysis, &mut changes);
+
+        assert!(result.contains("use theano_serialize::{save_state_dict, load_state_dict};"));
+    }
+
+    #[test]
+    fn test_generate_main_rs_torchvision_warnings() {
+        let import_analysis = ImportAnalysis {
+            uses_torch: false,
+            uses_nn: false,
+            uses_optim: false,
+            uses_data: false,
+            uses_functional: false,
+            torchvision_imports: vec![PyImport {
+                kind: ImportKind::Import,
+                module: "torchvision".to_string(),
+                names: vec![],
+                alias: None,
+                line: 1,
+            }],
+            unsupported_imports: vec![],
+        };
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let mut changes = Vec::new();
+        let result = generate_main_rs(&files, &import_analysis, &mut changes);
+
+        assert!(result.contains("Manual attention required"));
+        assert!(result.contains("torchvision"));
+    }
+
+    #[test]
+    fn test_generate_main_rs_with_class_and_statements() {
+        let import_analysis = ImportAnalysis {
+            uses_torch: true,
+            uses_nn: true,
+            uses_optim: true,
+            uses_data: false,
+            uses_functional: false,
+            torchvision_imports: vec![],
+            unsupported_imports: vec![],
+        };
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![PyClass {
+                name: "Net".to_string(),
+                bases: vec!["nn.Module".to_string()],
+                methods: vec![
+                    PyMethod {
+                        name: "__init__".to_string(),
+                        args: vec!["self".to_string()],
+                        body: vec![
+                            "super().__init__()".to_string(),
+                            "self.fc = nn.Linear(784, 10)".to_string(),
+                        ],
+                        line: 2,
+                    },
+                    PyMethod {
+                        name: "forward".to_string(),
+                        args: vec!["self".to_string(), "x".to_string()],
+                        body: vec!["return self.fc(x)".to_string()],
+                        line: 5,
+                    },
+                ],
+                body_lines: vec![],
+                line: 1,
+            }],
+            functions: vec![],
+            top_level: vec![
+                PyStatement { text: "model = Net()".to_string(), line: 8 },
+                PyStatement { text: "criterion = nn.MSELoss()".to_string(), line: 9 },
+            ],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let mut changes = Vec::new();
+        let result = generate_main_rs(&files, &import_analysis, &mut changes);
+
+        // Class struct
+        assert!(result.contains("struct Net"));
+        assert!(result.contains("fc: Linear"));
+        // Main function
+        assert!(result.contains("fn main()"));
+        assert!(result.contains("let model = Net::new()"));
+        assert!(result.contains("let criterion = MSELoss::new()"));
+    }
+
+    // =========================================================================
+    // Full Project Generation — end-to-end
+    // =========================================================================
+
+    #[test]
+    fn test_generate_project_basic() {
+        let pyfile = PyFile {
+            imports: vec![PyImport {
+                kind: ImportKind::Import,
+                module: "torch".to_string(),
+                names: vec![],
+                alias: None,
+                line: 1,
+            }],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![PyStatement {
+                text: "x = 42".to_string(),
+                line: 2,
+            }],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "test_project");
+
+        assert!(result.cargo_toml.contains("name = \"test_project\""));
+        assert!(result.main_rs.contains("fn main()"));
+        assert!(!result.changes.is_empty());
+    }
+
+    #[test]
+    fn test_generate_project_with_torchvision_warning() {
+        let pyfile = PyFile {
+            imports: vec![PyImport {
+                kind: ImportKind::Import,
+                module: "torchvision".to_string(),
+                names: vec![],
+                alias: None,
+                line: 1,
+            }],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "test_project");
+
+        // Should have a warning change
+        assert!(result.changes.iter().any(|c| {
+            c.kind == ChangeKind::Warning && c.description.contains("torchvision")
+        }));
+    }
+
+    #[test]
+    fn test_generate_project_with_distributed_warning() {
+        let pyfile = PyFile {
+            imports: vec![PyImport {
+                kind: ImportKind::Import,
+                module: "torch.distributed".to_string(),
+                names: vec![],
+                alias: None,
+                line: 1,
+            }],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "test_project");
+
+        assert!(result.changes.iter().any(|c| {
+            c.kind == ChangeKind::Warning && c.description.contains("torch.distributed")
+        }));
+    }
+
+    // =========================================================================
+    // Integration: MLP classifier end-to-end
+    // =========================================================================
+
+    #[test]
+    fn test_integration_mlp_classifier() {
+        let pyfile = PyFile {
+            imports: vec![
+                PyImport {
+                    kind: ImportKind::Import,
+                    module: "torch".to_string(),
+                    names: vec![],
+                    alias: None,
+                    line: 1,
+                },
+                PyImport {
+                    kind: ImportKind::FromImport,
+                    module: "torch.nn".to_string(),
+                    names: vec!["Module".to_string()],
+                    alias: None,
+                    line: 2,
+                },
+                PyImport {
+                    kind: ImportKind::FromImport,
+                    module: "torch.optim".to_string(),
+                    names: vec!["Adam".to_string()],
+                    alias: None,
+                    line: 3,
+                },
+            ],
+            classes: vec![PyClass {
+                name: "MLP".to_string(),
+                bases: vec!["nn.Module".to_string()],
+                methods: vec![
+                    PyMethod {
+                        name: "__init__".to_string(),
+                        args: vec!["self".to_string(), "input_dim".to_string(), "hidden_dim".to_string(), "output_dim".to_string()],
+                        body: vec![
+                            "super().__init__()".to_string(),
+                            "self.fc1 = nn.Linear(input_dim, hidden_dim)".to_string(),
+                            "self.fc2 = nn.Linear(hidden_dim, output_dim)".to_string(),
+                            "self.dropout = nn.Dropout(0.5)".to_string(),
+                        ],
+                        line: 5,
+                    },
+                    PyMethod {
+                        name: "forward".to_string(),
+                        args: vec!["self".to_string(), "x".to_string()],
+                        body: vec![
+                            "x = self.fc1(x)".to_string(),
+                            "x = self.dropout(x)".to_string(),
+                            "return self.fc2(x)".to_string(),
+                        ],
+                        line: 12,
+                    },
+                ],
+                body_lines: vec![],
+                line: 4,
+            }],
+            functions: vec![],
+            top_level: vec![
+                PyStatement { text: "model = MLP(784, 256, 10)".to_string(), line: 18 },
+                PyStatement { text: "criterion = nn.CrossEntropyLoss()".to_string(), line: 19 },
+                PyStatement { text: "optimizer = optim.Adam(model.parameters(), lr=0.001)".to_string(), line: 20 },
+                PyStatement { text: "for epoch in range(100):".to_string(), line: 21 },
+                PyStatement { text: "    optimizer.zero_grad()".to_string(), line: 22 },
+            ],
+        };
+        let files = vec![("train.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "mlp_classifier");
+
+        // Cargo.toml
+        assert!(result.cargo_toml.contains("name = \"mlp_classifier\""));
+        assert!(result.cargo_toml.contains("theano"));
+
+        // main.rs structure
+        let main = &result.main_rs;
+        assert!(main.contains("use theano::prelude::*;"));
+        assert!(main.contains("use theano::nn::*;"));
+        assert!(main.contains("use theano::optim::{Adam, SGD, Optimizer};"));
+
+        // MLP struct
+        assert!(main.contains("struct MLP"));
+        assert!(main.contains("fc1: Linear"));
+        assert!(main.contains("fc2: Linear"));
+        assert!(main.contains("dropout: Dropout"));
+
+        // Constructor
+        assert!(main.contains("fn new(input_dim: usize, hidden_dim: usize, output_dim: usize)"));
+        assert!(main.contains("Linear::new(input_dim, hidden_dim)"));
+        assert!(main.contains("Linear::new(hidden_dim, output_dim)"));
+        assert!(main.contains("Dropout::new(0.5)"));
+
+        // Forward
+        assert!(main.contains("impl Module for MLP"));
+        assert!(main.contains("fn forward(&self, input: &Variable) -> Variable"));
+
+        // Main function
+        assert!(main.contains("fn main()"));
+        assert!(main.contains("let model = MLP::new(784, 256, 10)"));
+        assert!(main.contains("let criterion = CrossEntropyLoss::new()"));
+        assert!(main.contains("Adam::new(model.parameters(), 0.001)"));
+        assert!(main.contains("for epoch in 0..100 {"));
+        assert!(main.contains("zero_grad()"));
+    }
+
+    // =========================================================================
+    // Integration: CNN with BatchNorm end-to-end
+    // =========================================================================
+
+    #[test]
+    fn test_integration_cnn_with_batchnorm() {
+        let pyfile = PyFile {
+            imports: vec![
+                PyImport {
+                    kind: ImportKind::Import,
+                    module: "torch".to_string(),
+                    names: vec![],
+                    alias: None,
+                    line: 1,
+                },
+                PyImport {
+                    kind: ImportKind::Import,
+                    module: "torch.nn".to_string(),
+                    names: vec![],
+                    alias: None,
+                    line: 2,
+                },
+            ],
+            classes: vec![PyClass {
+                name: "ConvNet".to_string(),
+                bases: vec!["nn.Module".to_string()],
+                methods: vec![
+                    PyMethod {
+                        name: "__init__".to_string(),
+                        args: vec!["self".to_string()],
+                        body: vec![
+                            "super().__init__()".to_string(),
+                            "self.features = nn.Sequential(".to_string(),
+                            "    nn.Conv2d(3, 64, 3, 1, 1, bias=False),".to_string(),
+                            "    nn.BatchNorm2d(64),".to_string(),
+                            "    nn.ReLU(True),".to_string(),
+                            "    nn.MaxPool2d(2),".to_string(),
+                            ")".to_string(),
+                            "self.classifier = nn.Linear(64, 10)".to_string(),
+                        ],
+                        line: 3,
+                    },
+                    PyMethod {
+                        name: "forward".to_string(),
+                        args: vec!["self".to_string(), "x".to_string()],
+                        body: vec![
+                            "x = self.features(x)".to_string(),
+                            "x = x.view(x.size(0), -1)".to_string(),
+                            "return self.classifier(x)".to_string(),
+                        ],
+                        line: 12,
+                    },
+                ],
+                body_lines: vec![],
+                line: 3,
+            }],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("cnn.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "cnn_example");
+
+        let main = &result.main_rs;
+
+        // Sequential with layers
+        assert!(main.contains("features: Sequential"));
+        assert!(main.contains("classifier: Linear"));
+        assert!(main.contains("Sequential::new(vec![])"));
+        assert!(main.contains(".add(Conv2d::with_options(3, 64, (3, 3), (1, 1), (1, 1), false))"));
+        assert!(main.contains(".add(BatchNorm1d::new(64))"));
+        assert!(main.contains(".add(ReLU)"));
+        assert!(main.contains(".add(MaxPool2d::new(2))"));
+    }
+
+    // =========================================================================
+    // Integration: GAN training loop end-to-end
+    // =========================================================================
+
+    #[test]
+    fn test_integration_gan_training_loop() {
+        let pyfile = PyFile {
+            imports: vec![
+                PyImport { kind: ImportKind::Import, module: "torch".to_string(), names: vec![], alias: None, line: 1 },
+                PyImport { kind: ImportKind::Import, module: "torch.nn".to_string(), names: vec![], alias: None, line: 2 },
+                PyImport { kind: ImportKind::Import, module: "torch.optim".to_string(), names: vec![], alias: None, line: 3 },
+            ],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![
+                PyStatement { text: "criterion = nn.BCELoss()".to_string(), line: 5 },
+                PyStatement { text: "optimizerD = optim.Adam(netD.parameters(), lr=0.0002, betas=(0.5, 0.999))".to_string(), line: 6 },
+                PyStatement { text: "optimizerG = optim.Adam(netG.parameters(), lr=0.0002, betas=(0.5, 0.999))".to_string(), line: 7 },
+                PyStatement { text: "for epoch in range(25):".to_string(), line: 8 },
+                PyStatement { text: "    for i, data in enumerate(dataloader, 0):".to_string(), line: 9 },
+                PyStatement { text: "        netD.zero_grad()".to_string(), line: 10 },
+                PyStatement { text: "        label = torch.full((64,), 1.0, device=device)".to_string(), line: 11 },
+                PyStatement { text: "        output = netD(real)".to_string(), line: 12 },
+                PyStatement { text: "        errD_real = criterion(output, label)".to_string(), line: 13 },
+                PyStatement { text: "        errD_real.backward()".to_string(), line: 14 },
+                PyStatement { text: "        noise = torch.randn(64, 100, 1, 1, device=device)".to_string(), line: 15 },
+                PyStatement { text: "        fake = netG(noise)".to_string(), line: 16 },
+                PyStatement { text: "        optimizerD.step()".to_string(), line: 17 },
+            ],
+        };
+        let files = vec![("dcgan.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "dcgan");
+
+        let main = &result.main_rs;
+
+        // Loss function
+        assert!(main.contains("let criterion = BCELoss::new()"));
+        // Optimizers with betas
+        assert!(main.contains("Adam::new(netD.parameters(), 0.0002)"));
+        assert!(main.contains(".betas(0.5, 0.999)"));
+        // Training loop
+        assert!(main.contains("for epoch in 0..25 {"));
+        assert!(main.contains("for (i, data) in dataloader.iter().enumerate() {"));
+        // Training ops
+        assert!(main.contains("netD.zero_grad()"));
+        assert!(main.contains("Tensor::full(&[64,], 1.0)"));
+        assert!(main.contains("netD.forward(&real)"));
+        assert!(main.contains("criterion.forward(&output, &label)"));
+        assert!(main.contains("errD_real.backward()"));
+        assert!(main.contains("Tensor::randn(&[64, 100, 1, 1])"));
+        assert!(main.contains("netG.forward(&noise)"));
+        assert!(main.contains("optimizerD.step()"));
+    }
+
+    // =========================================================================
+    // Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn test_translate_statement_comment_preservation() {
+        // Comments in main() should be preserved
+        let import_analysis = ImportAnalysis {
+            uses_torch: false, uses_nn: false, uses_optim: false, uses_data: false,
+            uses_functional: false, torchvision_imports: vec![], unsupported_imports: vec![],
+        };
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![
+                PyStatement { text: "# Training loop".to_string(), line: 1 },
+                PyStatement { text: "x = 42".to_string(), line: 2 },
+            ],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let mut changes = Vec::new();
+        let result = generate_main_rs(&files, &import_analysis, &mut changes);
+        assert!(result.contains("// Training loop"));
+    }
+
+    #[test]
+    fn test_translate_statement_skip_imports() {
+        let import_analysis = ImportAnalysis {
+            uses_torch: false, uses_nn: false, uses_optim: false, uses_data: false,
+            uses_functional: false, torchvision_imports: vec![], unsupported_imports: vec![],
+        };
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![
+                PyStatement { text: "import os".to_string(), line: 1 },
+                PyStatement { text: "from pathlib import Path".to_string(), line: 2 },
+                PyStatement { text: "x = 10".to_string(), line: 3 },
+            ],
+        };
+        let files = vec![("main.py".to_string(), pyfile)];
+        let mut changes = Vec::new();
+        let result = generate_main_rs(&files, &import_analysis, &mut changes);
+        // Import lines should be skipped in main()
+        assert!(!result.contains("import os"));
+        assert!(!result.contains("from pathlib"));
+        // But actual code should be present
+        assert!(result.contains("let x = 10"));
+    }
+
+    #[test]
+    fn test_translate_statement_backward_with_assignment() {
+        // errD = something; errD.backward() pattern
+        let result = translate_statement("errD.backward()");
+        assert_eq!(result, "errD.backward();");
+    }
+
+    #[test]
+    fn test_empty_pyfile_produces_valid_project() {
+        let pyfile = PyFile {
+            imports: vec![],
+            classes: vec![],
+            functions: vec![],
+            top_level: vec![],
+        };
+        let files = vec![("empty.py".to_string(), pyfile)];
+        let result = generate_project_named(&files, "empty_project");
+
+        assert!(result.cargo_toml.contains("name = \"empty_project\""));
+        assert!(result.main_rs.contains("fn main()"));
+        assert!(result.main_rs.contains('}'));
     }
 }
