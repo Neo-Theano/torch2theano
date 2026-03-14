@@ -1,0 +1,19 @@
+[package]
+name = "torch2theano"
+version = "0.1.0"
+edition = "2021"
+description = "Convert PyTorch Python source code to Neo Theano"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+regex = "1"
+anyhow = "1"
+colored = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
